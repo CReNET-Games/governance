@@ -1,0 +1,22 @@
+[project]
+name = "crenet-governance"
+version = "0.1.0"
+description = "Centralized governance layer and MCP compliance server for Crenet Games"
+authors = [
+    { name = "Emmanuel Jimenez", email = "hello@crenet.games" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp>=2.14.1",
+    "mcp[cli]<2.0.0",
+    "pydantic-settings>=2.15.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["mcp-server"]
+testpaths = ["tests"]

@@ -1,0 +1,23 @@
+{
+  "name": "CrenetGovernance",
+  "version": "0.1.0",
+  "description": "Centralized governance, compliance, and legal audit layer for Crenet Games repositories.",
+  "server": {
+    "entrypoint": "mcp-server/server.py:mcp",
+    "transport": "stdio"
+  },
+  "environment": {
+    "CRENET_ENV": "development",
+    "ASSETS_LEDGER_PATH": "./docs/assets_ledger.json"
+  },
+  "tools": [
+    {
+      "name": "log_ai_asset",
+      "description": "Logs an AI-generated asset into the active workspace's ./docs/assets_ledger.json for Steam AI disclosure and copyright defense."
+    },
+    {
+      "name": "verify_environment_isolation",
+      "description": "Verifies active workspace compliance with strict container and network isolation protocols (git user email verification and unauthorized network profile detection)."
+    }
+  ]
+}
