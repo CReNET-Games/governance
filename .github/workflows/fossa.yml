@@ -13,7 +13,12 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Run FOSSA Scan and Policy Check
+      - name: Run FOSSA Scan (Analyze)
+        uses: fossas/fossa-action@main
+        with:
+          api-key: ${{ secrets.FOSSA_API_KEY }}
+
+      - name: Run FOSSA Policy Check (Test)
         uses: fossas/fossa-action@main
         with:
           api-key: ${{ secrets.FOSSA_API_KEY }}
