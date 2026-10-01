@@ -1,6 +1,6 @@
 # AI Governance & Compliance Boilerplate for Indie Studios
 
-[![FOSSA Status](https://app.fossa.com/api/projects/custom?shield=true)](https://app.fossa.com/projects/custom)
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FCReNET-Games%2Fgovernance.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2FCReNET-Games%2Fgovernance?ref=badge_shield)
 
 This repository serves as a generalized, open-source governance framework designed for indie game developers working with AI Agents. It provides central legal compliance, IP protection, and an automated AI asset disclosure pipeline. It is built to be included as a Git submodule (e.g., under `governance/`) across multiple game repositories to enforce standardized rules for both human developers and autonomous AI Agents.
 
@@ -143,3 +143,6 @@ Run unit tests covering `log_ai_asset` workspace isolation, hybrid pipeline meta
 ```bash
 uv run pytest -v
 ```
+
+## License
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FCReNET-Games%2Fgovernance.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2FCReNET-Games%2Fgovernance?ref=badge_large)
