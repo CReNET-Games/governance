@@ -10,3 +10,7 @@ This file defines the primary agent rules and directives for all Crenet Games re
 ## Active Skills (`.agents/skills/`)
 
 None currently.
+
+## Active Hooks (`.agents/hooks.json` & `.claude/hooks/`)
+
+- **Asset Ledger Enforcement (`check_assets.py`)**: Automatically scans the workspace for newly created images and strictly enforces logging them into the `assets_ledger.json` via the `log_ai_asset` MCP tool. Applies to both Antigravity and Claude Code.

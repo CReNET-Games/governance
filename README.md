@@ -12,8 +12,9 @@ This boilerplate is designed to solve complex multi-agent orchestration and lega
 
 1. **FastMCP (Model Context Protocol)**: By wrapping governance logic in a FastMCP server, we decouple compliance checks and ledgering from the core game engine. This creates a standardized, language-agnostic interface that any AI agent (using the Gemini API, Claude, etc.) can query to understand local environment rules and record its actions.
 2. **JSON Ledgers for Authorship**: The Steam storefront requires strict disclosure for AI-generated assets. Instead of messy database dependencies, this architecture uses isolated JSON ledgers (`assets_ledger.json`) written directly to the active workspace. This provides a lightweight, immutable, and highly auditable paper trail for copyright defense and hybrid human-AI authorship tracking.
-3. **Git Submodule Injection (DRY)**: To maintain a single source of truth for agent behavior (e.g., code standards, accessibility rules, VPN checks), this repository acts as a submodule. The included `setup.sh` installer dynamically symlinks specific rules and skills into the parent repository's `.agents/` folder. This ensures all active game projects instantly inherit updated governance rules without code duplication.
-4. **Automated License Compliance (FOSSA)**: All dependencies and packages are automatically scanned by FOSSA in CI/CD pipelines to proactively detect open-source license violations and known security vulnerabilities.
+3. **Git Submodule Injection (DRY)**: To maintain a single source of truth for agent behavior (e.g., code standards, accessibility rules, VPN checks), this repository acts as a submodule. The included `setup.sh` installer dynamically symlinks specific rules, skills, and hooks into the parent repository. This ensures all active game projects instantly inherit updated governance rules without code duplication.
+4. **Enforced Agent Hooks**: The repository utilizes Antigravity (`hooks.json`) and Claude Code (`.claude/hooks/`) lifecycle hooks to strictly enforce governance policies (e.g., blocking an agent from exiting if it hasn't logged an AI-generated image).
+5. **Automated License Compliance (FOSSA)**: All dependencies and packages are automatically scanned by FOSSA in CI/CD pipelines to proactively detect open-source license violations and known security vulnerabilities.
 
 ---
 
@@ -32,7 +33,7 @@ git submodule add <repo-url> governance
 
 ### Symlink Lifecycle & `.gitignore` Management (`setup.sh`):
 
-1. **Granular Merging**: Creates a physical `.agents/` folder in the parent repository, symlinking rules and skills into place.
+1. **Granular Merging**: Creates physical `.agents/` and `.claude/` folders in the parent repository, symlinking rules, skills, and hooks into place.
 2. **Automated `.gitignore` Synchronization**: Automatically adds symlinked governance paths to the parent's `.gitignore`. Running `setup.sh` dynamically prunes removed entries.
 3. **Automated Teardown & Orphan Cleanup**: Removes broken symlinks and cleans up governance entries upon teardown.
 4. **Parent `AGENTS.md` Integration**: Appends a studio governance index reference to the parent project's `AGENTS.md`.
@@ -45,10 +46,16 @@ git submodule add <repo-url> governance
 governance/
 ├── .agents/                               # Canonical Agent Customization Directory
 │   ├── AGENTS.md                          # Primary agent governance rule index
+│   ├── hooks.json                         # Antigravity hooks wired to central scripts
 │   ├── rules/                             # Always-on domain & coding rules
 │   │   ├── code-standards.md              # HTML, CSS, TypeScript POJO enums, Makefile & Jest rules
 │   │   └── environment-isolation.md       # Strict environment isolation constraint check
 │   └── skills/                            # On-demand procedural skill runbooks
+├── .claude/
+│   └── hooks/                             # Claude Code hooks wired to central scripts
+│       └── check_assets.sh                # Wrapper script for asset ledger enforcement
+├── scripts/
+│   └── check_assets.py                    # Core python logic for asset ledger enforcement
 ├── mcp-server/
 │   └── server.py                          # Central FastMCP Server
 ├── schemas/
