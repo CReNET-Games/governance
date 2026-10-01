@@ -22,6 +22,8 @@ if [ "$1" == "--clean" ] || [ "$1" == "--uninstall" ]; then
     done
   fi
   rm -f "$PARENT_DIR/.antigravity"
+  rm -f "$PARENT_DIR/.agents/hooks.json"
+  rm -rf "$PARENT_DIR/.claude"
   echo "✔ Governance symlinks cleaned."
 
   # Clean .gitignore entries
@@ -30,6 +32,8 @@ if [ "$1" == "--clean" ] || [ "$1" == "--uninstall" ]; then
     tmp_gitignore=$(mktemp)
     grep -v "Crenet Governance" "$PARENT_GITIGNORE" | \
     grep -v "\.agents/rules/governance" | \
+    grep -v "\.agents/hooks.json" | \
+    grep -v "\.claude/" | \
     grep -v "\.agents/skills/" > "$tmp_gitignore" || true
     mv "$tmp_gitignore" "$PARENT_GITIGNORE"
     echo "✔ Cleaned governance entries from parent .gitignore"
@@ -83,6 +87,19 @@ if [ "$SCRIPT_DIR" != "$PARENT_DIR" ]; then
     fi
   done
 
+  # 3b. Link Hooks (Antigravity & Claude)
+  rm -f "$PARENT_DIR/.agents/hooks.json"
+  if [ -f "$SCRIPT_DIR/.agents/hooks.json" ]; then
+    ln -sfn "../governance/.agents/hooks.json" "$PARENT_DIR/.agents/hooks.json"
+    echo "✔ Linked Antigravity hooks -> $PARENT_DIR/.agents/hooks.json"
+  fi
+
+  rm -rf "$PARENT_DIR/.claude"
+  if [ -d "$SCRIPT_DIR/.claude" ]; then
+    ln -sfn "governance/.claude" "$PARENT_DIR/.claude"
+    echo "✔ Linked Claude hooks -> $PARENT_DIR/.claude"
+  fi
+
   # 4. Cleanup Orphan / Broken Symlinks to Governance
   if [ -d "$PARENT_DIR/.agents/rules" ]; then
     find "$PARENT_DIR/.agents/rules" -maxdepth 2 -type l | while read -r link; do
@@ -110,6 +127,8 @@ if [ "$SCRIPT_DIR" != "$PARENT_DIR" ]; then
   tmp_gi=$(mktemp)
   grep -v "Crenet Governance" "$PARENT_GITIGNORE" | \
   grep -v "\.agents/rules/governance" | \
+  grep -v "\.agents/hooks.json" | \
+  grep -v "\.claude/" | \
   grep -v "\.agents/skills/" > "$tmp_gi" || true
 
   {
@@ -117,6 +136,8 @@ if [ "$SCRIPT_DIR" != "$PARENT_DIR" ]; then
     echo ""
     echo "# Crenet Governance Symlinks (Managed via ./governance/setup.sh)"
     echo ".agents/rules/governance"
+    echo ".agents/hooks.json"
+    echo ".claude/"
     for skill_dir in "$SCRIPT_DIR/.agents/skills/"*; do
       if [ -d "$skill_dir" ]; then
         skill_name="$(basename "$skill_dir")"

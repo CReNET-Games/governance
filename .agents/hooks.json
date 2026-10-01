@@ -1,0 +1,17 @@
+{
+  "asset-ledger-enforcement": {
+    "enabled": true,
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "python3 ../scripts/check_assets.py --mode post_invocation"
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ../scripts/check_assets.py --mode stop"
+      }
+    ]
+  }
+}

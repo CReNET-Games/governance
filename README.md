@@ -2,6 +2,8 @@
 [![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FCReNET-Games%2Fgovernance.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2FCReNET-Games%2Fgovernance?ref=badge_shield)
 
 
+[![FOSSA Status](https://app.fossa.com/api/projects/custom?shield=true)](https://app.fossa.com/projects/custom)
+
 This repository serves as a generalized, open-source governance framework designed for indie game developers working with AI Agents. It provides central legal compliance, IP protection, and an automated AI asset disclosure pipeline. It is built to be included as a Git submodule (e.g., under `governance/`) across multiple game repositories to enforce standardized rules for both human developers and autonomous AI Agents.
 
 ---
@@ -13,6 +15,7 @@ This boilerplate is designed to solve complex multi-agent orchestration and lega
 1. **FastMCP (Model Context Protocol)**: By wrapping governance logic in a FastMCP server, we decouple compliance checks and ledgering from the core game engine. This creates a standardized, language-agnostic interface that any AI agent (using the Gemini API, Claude, etc.) can query to understand local environment rules and record its actions.
 2. **JSON Ledgers for Authorship**: The Steam storefront requires strict disclosure for AI-generated assets. Instead of messy database dependencies, this architecture uses isolated JSON ledgers (`assets_ledger.json`) written directly to the active workspace. This provides a lightweight, immutable, and highly auditable paper trail for copyright defense and hybrid human-AI authorship tracking.
 3. **Git Submodule Injection (DRY)**: To maintain a single source of truth for agent behavior (e.g., code standards, accessibility rules, VPN checks), this repository acts as a submodule. The included `setup.sh` installer dynamically symlinks specific rules and skills into the parent repository's `.agents/` folder. This ensures all active game projects instantly inherit updated governance rules without code duplication.
+4. **Automated License Compliance (FOSSA)**: All dependencies and packages are automatically scanned by FOSSA in CI/CD pipelines to proactively detect open-source license violations and known security vulnerabilities.
 
 ---
 
