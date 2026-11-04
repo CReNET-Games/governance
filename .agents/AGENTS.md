@@ -7,9 +7,9 @@ This file defines the primary agent rules and directives for all Crenet Games re
 - **[Code & Infrastructure Standards](file:///media/efaj/data/workspace/governance/.agents/rules/code-standards.md)**: Guidelines for HTML templates, semantic CSS, TypeScript POJO enums, Makefile orchestration, and Jest tests.
 - **[environment-isolation](file:///media/efaj/data/workspace/governance/.agents/rules/environment-isolation.md)**: Pre-commit strict environment isolation checks & Git config email validation.
 
-## Active Skills (`.agents/skills/`)
+## Active Skills (`.agents/skills/` & `.claude/skills/`)
 
-None currently.
+- **[atomic-commit-chain](.agents/skills/atomic-commit-chain/SKILL.md)**: Decomposes dirty post-exploration working trees into topologically ordered, `git bisect`-safe atomic commit chains with isolated worktree verification (`scripts/atomic_commit.py`) and a human-in-the-loop review gate.
 
 ## Active Hooks (`.agents/hooks.json` & `.claude/hooks/`)
 

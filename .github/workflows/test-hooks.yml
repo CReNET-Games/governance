@@ -24,4 +24,4 @@ jobs:
           
       - name: Test with pytest
         run: |
-          pytest tests/test_check_assets.py -v
+          pytest tests/test_check_assets.py tests/test_atomic_commit.py tests/test_setup_script.py -v

@@ -51,16 +51,24 @@ governance/
 │   │   ├── code-standards.md              # HTML, CSS, TypeScript POJO enums, Makefile & Jest rules
 │   │   └── environment-isolation.md       # Strict environment isolation constraint check
 │   └── skills/                            # On-demand procedural skill runbooks
+│       └── atomic-commit-chain/           # Stacked atomic commit & review gate workflow
+│           ├── SKILL.md                   # Cross-agent workflow instructions
+│           └── scripts/atomic_commit.py   # Symlink to ../../scripts/atomic_commit.py
 ├── .claude/
-│   └── hooks/                             # Claude Code hooks wired to central scripts
-│       └── check_assets.sh                # Wrapper script for asset ledger enforcement
+│   ├── hooks/                             # Claude Code hooks wired to central scripts
+│   │   └── check_assets.sh                # Wrapper script for asset ledger enforcement
+│   └── skills/
+│       └── atomic-commit-chain            # Symlink to ../../.agents/skills/atomic-commit-chain
 ├── scripts/
+│   ├── atomic_commit.py                   # Deterministic CLI for atomic commit chains (status, hunks, stage, verify)
 │   └── check_assets.py                    # Core python logic for asset ledger enforcement
 ├── mcp-server/
 │   └── server.py                          # Central FastMCP Server
 ├── schemas/
 │   └── asset_ledger_schema.json           # JSON Schema for asset ledger entries
 ├── tests/
+│   ├── test_atomic_commit.py              # Pytest suite for atomic commit CLI & isolated worktree verification
+│   ├── test_check_assets.py               # Pytest suite for asset ledger hooks
 │   ├── test_server.py                     # Pytest suite for MCP compliance tools
 │   └── test_setup_script.py               # Pytest suite for setup.sh installer lifecycle
 ├── setup.sh                               # Submodule lifecycle installer
@@ -133,6 +141,10 @@ The Model Context Protocol (MCP) server provides compliance tools to AI agents o
   - **Git Config Email**: Checks `git config user.email` in the local workspace. Allowed domains are configured via the `ALLOWED_EMAIL_DOMAINS` environment variable.
   - **Process / Network Detection**: Scans active processes (`ps aux`) for restricted network profiles configured via `RESTRICTED_NETWORK_PROFILES`.
   - **Action**: Raises a `RuntimeError` if unauthorized email domains or active restricted network profiles are detected, blocking unapproved commits or cloud deployments.
+
+### 3. Atomic Commit Chain Tools (`atomic_commit_status`, `atomic_commit_hunks`, `atomic_commit_stage`, `atomic_commit_verify`)
+- **Purpose**: Powers the `atomic-commit-chain` skill by decomposing dirty working trees after high-velocity exploration into topologically ordered, `git bisect`-safe commits with a human review gate.
+- **Single Source of Truth**: Delegates directly to `scripts/atomic_commit.py` to compute static import graphs (`status`), inspect numbered diff hunks (`hunks`), stage partial file hunks non-interactively (`stage`), and verify staged slices against unstaged dependencies in an isolated ephemeral `git write-tree` worktree (`verify`).
 
 ---
 
