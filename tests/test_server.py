@@ -103,9 +103,30 @@ def test_log_ai_asset_workspace_resolution(
         "subprocess.run", side_effect=mock_subprocess_run
     ):
         call_fn(log_ai_asset, file_name="asset.png", generation_type="pure_ai")
-        
+
         expected_docs_path = tmp_path / expected_docs_dir_name
         assert (expected_docs_path / "assets_ledger.json").exists()
+
+
+def test_log_ai_asset_explicit_workspace_dir_overrides_daemon_cwd(tmp_path: Path):
+    """Verifies explicit workspace_dir writes ledger to target game repo rather than MCP daemon cwd."""
+    daemon_cwd = tmp_path / "governance_daemon"
+    target_project = tmp_path / "xtractvania"
+    daemon_cwd.mkdir()
+    target_project.mkdir()
+
+    with patch("os.getcwd", return_value=str(daemon_cwd)), patch(
+        "subprocess.run", return_value=MagicMock(stdout="", returncode=0)
+    ):
+        call_fn(
+            log_ai_asset,
+            file_name="client/public/assets/bg.png",
+            generation_type="pure_ai",
+            workspace_dir=str(target_project),
+        )
+
+    assert (target_project / "docs" / "assets_ledger.json").exists()
+    assert not (daemon_cwd / "docs" / "assets_ledger.json").exists()
 
 
 @pytest.mark.parametrize(

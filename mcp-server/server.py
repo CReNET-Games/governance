@@ -36,6 +36,47 @@ VALID_GENERATION_TYPES = {
 }
 
 
+def _resolve_target_workspace(
+    workspace_dir: Optional[str] = None,
+    file_hint: Optional[str] = None,
+) -> Path:
+    """Resolve the active target repository root, avoiding the MCP daemon's cwd trap."""
+    if workspace_dir:
+        base_dir = Path(workspace_dir).resolve()
+    elif file_hint and Path(file_hint).is_absolute():
+        hint_path = Path(file_hint).resolve()
+        base_dir = hint_path if hint_path.is_dir() else hint_path.parent
+    else:
+        base_dir = Path(os.getcwd()).resolve()
+
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--show-superproject-working-tree"],
+            cwd=base_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        super_project = res.stdout.strip()
+        if super_project:
+            return Path(super_project).resolve()
+
+        res = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=base_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        git_root = res.stdout.strip()
+        if git_root:
+            return Path(git_root).resolve()
+    except Exception:
+        pass
+
+    return base_dir
+
+
 @mcp.tool()
 def log_ai_asset(
     file_name: str,
@@ -46,12 +87,13 @@ def log_ai_asset(
     ai_seed: Optional[str] = None,
     human_source_file_ref: Optional[str] = None,
     human_modification_description: Optional[str] = None,
+    workspace_dir: Optional[str] = None,
 ) -> str:
     """Logs an AI-generated asset into the active workspace's docs asset ledger.
 
     Maintains a strict legal paper trail required for Steam AI disclosures,
     copyright defense, and hybrid human-AI authorship provenance tracking.
-    Writes directly to `./docs/assets_ledger.json` in the current active workspace.
+    Writes directly to `./docs/assets_ledger.json` in the target workspace.
 
     Args:
         file_name: Path or filename of the final shipped asset in the repository.
@@ -62,9 +104,10 @@ def log_ai_asset(
         ai_seed: Optional generation seed for reproducibility.
         human_source_file_ref: Path to layered project file (e.g., .psd, .kra) proving human edits.
         human_modification_description: Brief summary of human post-edits.
+        workspace_dir: Optional root directory of the target project repository.
 
     Returns:
-        A confirmation message indicating successful recording in the active workspace ledger.
+        A confirmation message indicating successful recording in the target workspace ledger.
 
     Raises:
         ValueError: If generation_type is invalid.
@@ -74,34 +117,7 @@ def log_ai_asset(
             f"Invalid generation_type '{generation_type}'. Must be one of: {sorted(list(VALID_GENERATION_TYPES))}"
         )
 
-    active_workspace = Path(os.getcwd()).resolve()
-
-    # If running inside a submodule, resolve to the parent containing project.
-    # Otherwise, resolve to the top-level git repository.
-    try:
-        res = subprocess.run(
-            ["git", "rev-parse", "--show-superproject-working-tree"],
-            cwd=active_workspace,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        super_project = res.stdout.strip()
-        if super_project:
-            active_workspace = Path(super_project).resolve()
-        else:
-            res = subprocess.run(
-                ["git", "rev-parse", "--show-toplevel"],
-                cwd=active_workspace,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            git_root = res.stdout.strip()
-            if git_root:
-                active_workspace = Path(git_root).resolve()
-    except Exception:
-        pass
+    active_workspace = _resolve_target_workspace(workspace_dir=workspace_dir, file_hint=file_name)
     docs_dir = active_workspace / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
     ledger_path = docs_dir / "assets_ledger.json"
