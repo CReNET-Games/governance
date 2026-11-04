@@ -30,6 +30,18 @@ def mock_parent_workspace(tmp_path: Path) -> Path:
         symlinks=True,
         ignore=shutil.ignore_patterns("__pycache__"),
     )
+    shutil.copytree(
+        GOVERNANCE_REPO_DIR / ".claude",
+        submodule_dir / ".claude",
+        symlinks=True,
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    shutil.copytree(
+        GOVERNANCE_REPO_DIR / "scripts",
+        submodule_dir / "scripts",
+        symlinks=True,
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
 
     # Create a mock skill to test setup.sh skill symlinking logic
     mock_skill_dir = submodule_dir / ".agents" / "skills" / "mock-skill"
@@ -58,10 +70,19 @@ def test_setup_script_initialization(mock_parent_workspace: Path):
     assert rules_link.is_symlink()
     assert rules_link.exists()
 
-    # 2. Verify skills symlink
+    # 2. Verify skills symlinks (mock-skill and atomic-commit-chain across .agents and .claude)
     mock_skill_link = mock_parent_workspace / ".agents" / "skills" / "mock-skill"
     assert mock_skill_link.is_symlink()
     assert mock_skill_link.exists()
+
+    atomic_skill_link = mock_parent_workspace / ".agents" / "skills" / "atomic-commit-chain"
+    assert atomic_skill_link.is_symlink()
+    assert (atomic_skill_link / "SKILL.md").exists()
+    assert (atomic_skill_link / "scripts" / "atomic_commit.py").exists()
+
+    claude_skill_link = mock_parent_workspace / ".claude" / "skills" / "atomic-commit-chain"
+    assert claude_skill_link.is_symlink()
+    assert (claude_skill_link / "SKILL.md").exists()
 
     # 3. Verify .gitignore
     gitignore = mock_parent_workspace / ".gitignore"
@@ -69,6 +90,7 @@ def test_setup_script_initialization(mock_parent_workspace: Path):
     gi_content = gitignore.read_text()
     assert ".agents/rules/governance" in gi_content
     assert ".agents/skills/mock-skill" in gi_content
+    assert ".agents/skills/atomic-commit-chain" in gi_content
 
     # 4. Verify AGENTS.md
     agents_md = mock_parent_workspace / "AGENTS.md"
