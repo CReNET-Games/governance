@@ -7,7 +7,14 @@ import subprocess
 from unittest.mock import MagicMock, patch
 import pytest
 
-from server import log_ai_asset, verify_environment_isolation
+from server import (
+    atomic_commit_hunks,
+    atomic_commit_stage,
+    atomic_commit_status,
+    atomic_commit_verify,
+    log_ai_asset,
+    verify_environment_isolation,
+)
 
 
 def call_fn(tool, *args, **kwargs):
@@ -183,3 +190,63 @@ def test_verify_environment_isolation_blocks_active_network_profile():
         with pytest.raises(RuntimeError) as exc_info:
             call_fn(verify_environment_isolation)
         assert "unauthorized network profile" in str(exc_info.value).lower()
+
+
+def test_mcp_atomic_commit_tools_end_to_end(tmp_path: Path):
+    """Verifies the 4 MCP atomic_commit_* tools delegate cleanly to scripts/atomic_commit.py."""
+    repo = tmp_path / "game_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "dev@crenet.games"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test Dev"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "commit.gpgsign", "false"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    base_file = repo / "shared.ts"
+    base_file.write_text("export const A = 1;\n", encoding="utf-8")
+    subprocess.run(["git", "add", "shared.ts"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "chore: init"], cwd=repo, check=True, capture_output=True
+    )
+
+    # Modify shared.ts and add server.ts importing shared.ts
+    base_file.write_text("export const A = 1;\nexport const B = 2;\n", encoding="utf-8")
+    (repo / "server.ts").write_text("import { B } from './shared';\n", encoding="utf-8")
+
+    # 1. atomic_commit_status
+    status_res = call_fn(atomic_commit_status, workspace_dir=str(repo))
+    assert status_res["total_dirty_files"] == 2
+    assert status_res["topological_waves"] == [["shared.ts"], ["server.ts"]]
+
+    # 2. atomic_commit_hunks
+    hunks_res = call_fn(atomic_commit_hunks, workspace_dir=str(repo), file="shared.ts")
+    assert hunks_res["hunk_count"] == 1
+    assert "+export const B = 2;" in hunks_res["hunks"][0]["preview"]
+
+    # 3. atomic_commit_stage (stage shared.ts hunk 1)
+    stage_res = call_fn(
+        atomic_commit_stage,
+        workspace_dir=str(repo),
+        hunks=["shared.ts:1"],
+        reset=True,
+    )
+    assert stage_res["staged_files"] == ["shared.ts"]
+
+    # 4. atomic_commit_verify
+    verify_res = call_fn(atomic_commit_verify, workspace_dir=str(repo))
+    assert verify_res["passed"] is True
+    assert verify_res["staged_files"] == ["shared.ts"]

@@ -1,7 +1,8 @@
 """Crenet Games Core Standards MCP Server.
 
-Provides centralized governance, compliance checks, and legal paper trail logging
-for human developers and AI Agents operating across Crenet Games repositories.
+Provides centralized governance, compliance checks, legal paper trail logging,
+and deterministic atomic commit chain orchestration for human developers and
+AI Agents operating across Crenet Games repositories.
 """
 
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 from typing import List, Optional
 
 try:
@@ -16,16 +18,30 @@ try:
 except ImportError:
     from mcp.server.fastmcp import FastMCP
 
+# Ensure scripts/ directory is importable for Single Source of Truth delegation
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+import atomic_commit
+
 # Instantiate the central Model Context Protocol server for Crenet Games
 mcp = FastMCP("CrenetGovernance")
 
 # Approved compliant email domains
 _ALLOWED_DOMAINS_ENV = os.environ.get("ALLOWED_EMAIL_DOMAINS", "@crenet.games")
-APPROVED_EMAIL_DOMAINS = tuple(domain.strip().lower() for domain in _ALLOWED_DOMAINS_ENV.split(",") if domain.strip())
+APPROVED_EMAIL_DOMAINS = tuple(
+    domain.strip().lower() for domain in _ALLOWED_DOMAINS_ENV.split(",") if domain.strip()
+)
 
 # Restricted network indicators to flag in process scans
-_RESTRICTED_NETWORK_ENV = os.environ.get("RESTRICTED_NETWORK_PROFILES", "cisco,anyconnect,globalprotect,zscaler,pulse,forticlient")
-RESTRICTED_NETWORK_KEYWORDS = tuple(kw.strip().lower() for kw in _RESTRICTED_NETWORK_ENV.split(",") if kw.strip())
+_RESTRICTED_NETWORK_ENV = os.environ.get(
+    "RESTRICTED_NETWORK_PROFILES",
+    "cisco,anyconnect,globalprotect,zscaler,pulse,forticlient",
+)
+RESTRICTED_NETWORK_KEYWORDS = tuple(
+    kw.strip().lower() for kw in _RESTRICTED_NETWORK_ENV.split(",") if kw.strip()
+)
 
 # Allowed generation pipeline methodologies
 VALID_GENERATION_TYPES = {
@@ -197,7 +213,9 @@ def verify_environment_isolation(workspace_dir: Optional[str] = None) -> str:
         )
         git_email = res.stdout.strip().lower()
     except Exception as exc:
-        raise RuntimeError(f"Environment Isolation Check Error: Failed to execute git config check: {exc}")
+        raise RuntimeError(
+            f"Environment Isolation Check Error: Failed to execute git config check: {exc}"
+        )
 
     if not git_email:
         raise RuntimeError(
@@ -242,6 +260,126 @@ def verify_environment_isolation(workspace_dir: Optional[str] = None) -> str:
     return (
         f"Environment Isolation Check Passed: Git email '{git_email}' is compliant and no unauthorized "
         "network profiles were detected."
+    )
+
+
+@mcp.tool()
+def atomic_commit_status(workspace_dir: str = ".") -> dict:
+    """Inspects dirty/untracked files, hunk counts, static import graph, and topological commit waves.
+
+    Read-only tool that analyzes the target Git repository to help partition uncommitted
+    changes into a dependency-ordered atomic commit chain.
+
+    Args:
+        workspace_dir: Path to the target Git repository or workspace directory.
+
+    Returns:
+        Dictionary containing `repo_root`, `total_dirty_files`, `files`, `topological_waves`,
+        and `mutual_dependency_cycles`.
+    """
+    repo = atomic_commit.get_repo_root(Path(workspace_dir).resolve())
+    return atomic_commit.inspect_status(repo)
+
+
+@mcp.tool()
+def atomic_commit_hunks(workspace_dir: str, file: str, cached: bool = False) -> dict:
+    """Lists numbered diff hunks for a file to prepare non-interactive partial staging.
+
+    Read-only tool that parses `git diff` into 1-based numbered hunks with line ranges
+    and previews so specific hunks can be staged via `atomic_commit_stage`.
+
+    Args:
+        workspace_dir: Path to the target Git repository or workspace directory.
+        file: Repository-relative path to the file to inspect.
+        cached: If True, inspect already-staged hunks in the index instead of unstaged working-tree hunks.
+
+    Returns:
+        Dictionary containing `file`, `hunk_count`, and `hunks` metadata.
+    """
+    repo = atomic_commit.get_repo_root(Path(workspace_dir).resolve())
+    fdiff = atomic_commit.parse_single_file_diff(repo, file, cached=cached)
+    return {
+        "file": fdiff.file_path,
+        "hunk_count": len(fdiff.hunks),
+        "hunks": [
+            {
+                "index": h.index,
+                "header": h.header.strip(),
+                "old_start": h.old_start,
+                "old_count": h.old_count,
+                "new_start": h.new_start,
+                "new_count": h.new_count,
+                "section_hint": h.section_hint,
+                "preview": h.preview,
+            }
+            for h in fdiff.hunks
+        ],
+    }
+
+
+@mcp.tool()
+def atomic_commit_stage(
+    workspace_dir: str,
+    files: Optional[List[str]] = None,
+    hunks: Optional[List[str]] = None,
+    reset: bool = False,
+) -> dict:
+    """Non-interactively stages full files and/or specific numbered hunks into the Git index.
+
+    Args:
+        workspace_dir: Path to the target Git repository or workspace directory.
+        files: Optional list of full repository-relative file paths to stage via `git add`.
+        hunks: Optional list of partial-file hunk specs in the format `'path/to/file:1,3'`.
+        reset: If True, unstages all currently staged changes (`git reset`) before staging this slice.
+
+    Returns:
+        Dictionary containing `staged_files` currently in the Git index.
+    """
+    repo = atomic_commit.get_repo_root(Path(workspace_dir).resolve())
+    if reset:
+        if atomic_commit.has_head_commit(repo):
+            atomic_commit.run_git(["reset"], repo)
+        else:
+            atomic_commit.run_git(["rm", "--cached", "-r", "--quiet", "."], repo, check=False)
+
+    if files:
+        atomic_commit.run_git(["add", "--", *files], repo)
+
+    if hunks:
+        for spec in hunks:
+            file_path, indices = atomic_commit._parse_hunk_spec(spec)
+            atomic_commit.stage_file_hunks(repo, file_path, indices)
+
+    staged = atomic_commit.get_staged_files(repo)
+    return {"staged_files": sorted(staged.keys())}
+
+
+@mcp.tool()
+def atomic_commit_verify(
+    workspace_dir: str = ".",
+    commands: Optional[List[str]] = None,
+    skip_worktree: bool = False,
+) -> dict:
+    """Deterministically verifies that the staged slice (`HEAD + index`) is self-contained and passes checks.
+
+    Performs static index-vs-worktree dependency isolation checks (ensuring staged files do not
+    import unstaged/untracked files or symbols from unstaged hunks), checks for conflict markers
+    and unlogged image assets, and executes `commands` inside an isolated ephemeral `git write-tree`
+    worktree without disturbing the developer's working tree.
+
+    Args:
+        workspace_dir: Path to the target Git repository or workspace directory.
+        commands: Optional list of shell commands (e.g., typecheck, unit tests) to run in the isolated worktree.
+        skip_worktree: If True, only run fast static index-vs-worktree checks without creating a temporary worktree.
+
+    Returns:
+        Dictionary with `passed` (bool), `staged_files`, `errors`, and `command_results`.
+    """
+    repo = atomic_commit.get_repo_root(Path(workspace_dir).resolve())
+    return atomic_commit.verify_staged_slice(
+        repo,
+        commands=commands or [],
+        skip_worktree=skip_worktree,
     )
 
 

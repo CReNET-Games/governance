@@ -18,6 +18,22 @@
     {
       "name": "verify_environment_isolation",
       "description": "Verifies active workspace compliance with strict container and network isolation protocols (git user email verification and unauthorized network profile detection)."
+    },
+    {
+      "name": "atomic_commit_status",
+      "description": "Inspects dirty/untracked files, hunk counts, static import graph, and topological commit waves for an atomic commit chain."
+    },
+    {
+      "name": "atomic_commit_hunks",
+      "description": "Lists numbered diff hunks for a file to prepare non-interactive partial staging."
+    },
+    {
+      "name": "atomic_commit_stage",
+      "description": "Non-interactively stages full files and/or specific numbered hunks into the Git index."
+    },
+    {
+      "name": "atomic_commit_verify",
+      "description": "Deterministically verifies that the staged slice (HEAD + index) has no unstaged dependencies and passes checks in an isolated worktree."
     }
   ]
 }
