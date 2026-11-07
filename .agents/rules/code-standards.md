@@ -1,3 +1,8 @@
+---
+name: code-standards
+description: Guidelines for HTML templates, semantic CSS, TypeScript POJO enums, Makefile orchestration, and Jest/Vitest testing standards.
+---
+
 # Code & Infrastructure Standards
 
 The following guidelines apply to code structure, UI template patterns, TypeScript, testing, and infrastructure across Crenet Games projects.
