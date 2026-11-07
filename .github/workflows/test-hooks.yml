@@ -24,4 +24,4 @@ jobs:
           
       - name: Test with pytest
         run: |
-          pytest tests/test_check_assets.py tests/test_atomic_commit.py tests/test_setup_script.py -v
+          pytest tests/test_check_assets.py tests/test_atomic_commit.py tests/test_setup_script.py tests/test_skill_and_rule_lint.py tests/test_evals_llm.py -m "not llm_eval" -v

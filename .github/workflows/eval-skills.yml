@@ -1,0 +1,39 @@
+name: Skill & Rule LLM Evals
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - ".agents/**"
+      - "mcp-server/**"
+      - "tests/test_evals_llm.py"
+      - ".github/workflows/eval-skills.yml"
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - ".agents/**"
+      - "mcp-server/**"
+      - "tests/test_evals_llm.py"
+      - ".github/workflows/eval-skills.yml"
+  workflow_dispatch:
+
+jobs:
+  llm-evals:
+    runs-on: ubuntu-latest
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run Live Skill & Rule LLM Evals
+        if: ${{ env.GEMINI_API_KEY != '' || env.GROQ_API_KEY != '' || env.OPENROUTER_API_KEY != '' }}
+        run: uv run pytest -m "llm_eval" -v
