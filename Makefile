@@ -13,7 +13,7 @@ lint-skills:
 ## Run live LLM evaluations (loads untracked .env.local if present, or uses exported env vars)
 test-evals:
 	@set -a; [ -f .env.local ] && . ./.env.local; set +a; \
-	$(PYTEST) -m "llm_eval" -v
+	$(PYTEST) -m "llm_eval" -v -s
 
 ## Run both deterministic tests and live LLM evaluations
 test-all: test test-evals

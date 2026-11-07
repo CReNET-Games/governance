@@ -1,4 +1,4 @@
-"""Multi-provider free-tier LLM evaluations with short-circuit deterministic graders and batched 8-rubric LLM-as-a-judge."""
+"""Multi-provider free-tier LLM evaluations with short-circuit deterministic graders, batched 8-rubric LLM-as-a-judge, and GitHub Step Summary scorecards."""
 
 from dataclasses import dataclass, field
 import json
@@ -55,6 +55,13 @@ class LLMProviderConfig:
     base_url: str
     api_key: str = field(repr=False)
     model: str
+
+
+@dataclass(frozen=True)
+class EvalScorecardRow:
+    dimension: str
+    verdict: str  # "PASS" | "FAIL"
+    evidence: str
 
 
 def _load_dotenv_local_if_present() -> None:
@@ -186,6 +193,77 @@ def call_llm_chat(
 
 
 # ---------------------------------------------------------------------------
+# Scorecard Formatting & GitHub Actions Step Summary ($GITHUB_STEP_SUMMARY)
+# ---------------------------------------------------------------------------
+
+
+def _escape_md_cell(text: str) -> str:
+    """Escape pipe characters and newlines so Markdown table cells render cleanly."""
+    return " ".join(text.replace("|", "\\|").splitlines()).strip()
+
+
+def format_scorecard_markdown(
+    suite_title: str,
+    rows: list[EvalScorecardRow],
+    candidate_output: str | None = None,
+) -> str:
+    """Render a GitHub-Flavored Markdown scorecard table with optional collapsible model output."""
+    lines = [
+        f"### {suite_title}",
+        "",
+        "| Dimension / Check | Verdict | Reasoning / Evidence |",
+        "| :--- | :---: | :--- |",
+    ]
+    for row in rows:
+        badge = "PASS" if row.verdict == "PASS" else "FAIL"
+        lines.append(
+            f"| `{_escape_md_cell(row.dimension)}` | **{badge}** | {_escape_md_cell(row.evidence)} |"
+        )
+
+    if candidate_output:
+        lines.extend(
+            [
+                "",
+                "<details>",
+                "<summary>View Candidate Model Output</summary>",
+                "",
+                "````text",
+                candidate_output.strip(),
+                "````",
+                "</details>",
+            ]
+        )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def record_scorecard_section(
+    suite_title: str,
+    rows: list[EvalScorecardRow],
+    candidate_output: str | None = None,
+    summary_file_path: str | None = None,
+) -> str:
+    """Print scorecard to stdout (for terminal & CI logs) and append to $GITHUB_STEP_SUMMARY if set."""
+    markdown = format_scorecard_markdown(suite_title, rows, candidate_output=candidate_output)
+
+    print(f"\n{'=' * 78}")
+    print(f"SCORECARD: {suite_title}")
+    print("-" * 78)
+    for row in rows:
+        print(f"  [{row.verdict:4s}] {row.dimension:<22s} | {row.evidence}")
+    print(f"{'=' * 78}")
+
+    target_summary = summary_file_path or os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
+    if target_summary:
+        Path(target_summary).parent.mkdir(parents=True, exist_ok=True)
+        with open(target_summary, "a", encoding="utf-8") as handle:
+            handle.write(markdown + "\n")
+
+    return markdown
+
+
+# ---------------------------------------------------------------------------
 # Stage 1: Deterministic Short-Circuit Graders (0 API calls, <1ms)
 # ---------------------------------------------------------------------------
 
@@ -234,8 +312,10 @@ def grade_atomic_commit_plan(output: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def parse_judge_json_verdicts(raw_judge_response: str, expected_rubrics: dict[str, str]) -> list[str]:
-    """Parse batched JSON verdicts from the LLM judge and return any failed or missing rubric reasons."""
+def parse_judge_json_entries(
+    raw_judge_response: str, expected_rubrics: dict[str, str]
+) -> tuple[list[EvalScorecardRow], list[str]]:
+    """Parse batched JSON verdicts into scorecard rows and a list of failure strings."""
     cleaned = raw_judge_response.strip()
     fence_match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", cleaned)
     if fence_match:
@@ -249,22 +329,41 @@ def parse_judge_json_verdicts(raw_judge_response: str, expected_rubrics: dict[st
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError as exc:
-        return [f"Judge did not return valid JSON ({exc}): {raw_judge_response!r}"]
+        msg = f"Judge did not return valid JSON ({exc}): {raw_judge_response!r}"
+        return ([EvalScorecardRow(dimension="json_parse", verdict="FAIL", evidence=msg)], [msg])
 
     if not isinstance(parsed, dict):
-        return [f"Judge JSON root must be an object, got: {type(parsed).__name__}"]
+        msg = f"Judge JSON root must be an object, got: {type(parsed).__name__}"
+        return ([EvalScorecardRow(dimension="json_root", verdict="FAIL", evidence=msg)], [msg])
 
+    rows: list[EvalScorecardRow] = []
     failures: list[str] = []
     for rubric_key in expected_rubrics:
         entry = parsed.get(rubric_key)
         if not isinstance(entry, dict):
-            failures.append(f"[{rubric_key}] Missing rubric object in judge output.")
+            msg = "Missing rubric object in judge output."
+            rows.append(EvalScorecardRow(dimension=rubric_key, verdict="FAIL", evidence=msg))
+            failures.append(f"[{rubric_key}] {msg}")
             continue
         verdict = str(entry.get("verdict", "")).strip().upper()
-        evidence = str(entry.get("evidence", "")).strip()
-        if verdict != "PASS":
-            failures.append(f"[{rubric_key}] {verdict or 'INVALID'}: {evidence or 'No evidence provided.'}")
+        evidence = str(entry.get("evidence", "")).strip() or "No evidence provided."
+        normalized_verdict = "PASS" if verdict == "PASS" else "FAIL"
+        rows.append(
+            EvalScorecardRow(
+                dimension=rubric_key,
+                verdict=normalized_verdict,
+                evidence=evidence,
+            )
+        )
+        if normalized_verdict != "PASS":
+            failures.append(f"[{rubric_key}] {verdict or 'INVALID'}: {evidence}")
 
+    return (rows, failures)
+
+
+def parse_judge_json_verdicts(raw_judge_response: str, expected_rubrics: dict[str, str]) -> list[str]:
+    """Return only failure messages from a batched JSON judge response."""
+    _, failures = parse_judge_json_entries(raw_judge_response, expected_rubrics)
     return failures
 
 
@@ -272,9 +371,12 @@ def judge_with_batched_rubrics(
     candidate_text: str,
     rubrics: dict[str, str],
     context_description: str,
+    suite_title: str | None = None,
+    pre_rows: list[EvalScorecardRow] | None = None,
+    include_candidate_in_summary: bool = True,
     provider: LLMProviderConfig | None = None,
 ) -> list[str]:
-    """Evaluate `candidate_text` against multiple binary rubrics in a SINGLE batched LLM call."""
+    """Evaluate `candidate_text` against multiple binary rubrics in a SINGLE batched LLM call and record scorecard."""
     rubric_lines = "\n".join(f'- "{key}": {desc}' for key, desc in rubrics.items())
     schema_example = json.dumps(
         {
@@ -306,11 +408,21 @@ def judge_with_batched_rubrics(
         provider=provider,
         temperature=0.0,
     )
-    return parse_judge_json_verdicts(raw_response, rubrics)
+    judge_rows, failures = parse_judge_json_entries(raw_response, rubrics)
+
+    if suite_title:
+        all_rows = [*(pre_rows or []), *judge_rows]
+        record_scorecard_section(
+            suite_title=suite_title,
+            rows=all_rows,
+            candidate_output=candidate_text if include_candidate_in_summary else None,
+        )
+
+    return failures
 
 
 # ---------------------------------------------------------------------------
-# Offline Unit Tests for Graders, Judge Parser & Provider Resolution (`make test`)
+# Offline Unit Tests for Graders, Judge Parser & Scorecard (`make test`)
 # ---------------------------------------------------------------------------
 
 
@@ -447,6 +559,36 @@ def test_parse_judge_json_verdicts_cases(
         assert any(expected_failure_substring in f for f in failures), f"Got: {failures}"
 
 
+def test_record_scorecard_section_writes_github_step_summary(tmp_path: Path):
+    """Verifies record_scorecard_section formats GFM tables and collapsible details into $GITHUB_STEP_SUMMARY."""
+    summary_file = tmp_path / "step_summary.md"
+    rows = [
+        EvalScorecardRow(
+            dimension="discoverability",
+            verdict="PASS",
+            evidence="Clear frontmatter trigger keywords | no pipe breakage",
+        ),
+        EvalScorecardRow(
+            dimension="safety",
+            verdict="FAIL",
+            evidence="Did not pause for approval",
+        ),
+    ]
+    md = record_scorecard_section(
+        suite_title="Unit Test Suite",
+        rows=rows,
+        candidate_output="const x = 1;",
+        summary_file_path=str(summary_file),
+    )
+    assert summary_file.exists()
+    content = summary_file.read_text(encoding="utf-8")
+    assert content.strip() == md.strip()
+    assert "### Unit Test Suite" in content
+    assert "| `discoverability` | **PASS** | Clear frontmatter trigger keywords \\| no pipe breakage |" in content
+    assert "| `safety` | **FAIL** | Did not pause for approval |" in content
+    assert "<summary>View Candidate Model Output</summary>" in content
+
+
 # ---------------------------------------------------------------------------
 # Live Free-Tier LLM Evaluations (`make test-evals` / `pytest -m llm_eval`)
 # Total API budget: 8 calls per run (1 authoring audit + 3 routing + 2x2 gen+judge)
@@ -473,6 +615,8 @@ def test_eval_skill_and_rule_authoring_rubrics():
             "agentic customization dimensions (Discoverability, Actionability, Safety, Scope, Conciseness, "
             "Resilience, Tool-Use Fidelity, Verifiability)."
         ),
+        suite_title="1. 8-Dimension Skill & Rule Authoring Audit (`SKILL.md` & `.agents/rules/*.md`)",
+        include_candidate_in_summary=False,
     )
     assert not failures, "Skill/Rule authoring rubric audit failed:\n" + "\n".join(
         f"- {f}" for f in failures
@@ -515,7 +659,18 @@ def test_eval_skill_and_rule_routing(developer_prompt: str, expected_target: str
     )
 
     response = call_llm_chat(system_prompt=system_prompt, user_prompt=developer_prompt).strip()
-    assert expected_target in response, (
+    passed = expected_target in response
+    record_scorecard_section(
+        suite_title=f"2. Skill & Rule Routing (`{expected_target}`)",
+        rows=[
+            EvalScorecardRow(
+                dimension=f"route:{expected_target}",
+                verdict="PASS" if passed else "FAIL",
+                evidence=f"Prompt: {developer_prompt!r} -> Model routed to: {response!r}",
+            )
+        ],
+    )
+    assert passed, (
         f"Expected routing to '{expected_target}' for prompt {developer_prompt!r}, got: {response!r}"
     )
 
@@ -540,10 +695,24 @@ def test_eval_code_standards_rule_compliance():
 
     # Stage 1: Fast deterministic check (short-circuits before spending a judge call)
     violations = grade_code_standards_output(response)
+    if violations:
+        record_scorecard_section(
+            suite_title="3. Behavioral Eval: `code-standards.md` (Stage 1 Short-Circuit Failure)",
+            rows=[
+                EvalScorecardRow(dimension="stage1_regex_gate", verdict="FAIL", evidence="; ".join(violations))
+            ],
+            candidate_output=response,
+        )
     assert not violations, (
         "Model failed Stage 1 deterministic code-standards checks:\n"
         + "\n".join(f"- {v}" for v in violations)
         + f"\n\n--- Model Output ---\n{response}"
+    )
+
+    stage1_row = EvalScorecardRow(
+        dimension="stage1_regex_gate",
+        verdict="PASS",
+        evidence="Verified POJO `as const` enum (no TS `enum`), `test.each`/`it.each`, and `create*` factory function.",
     )
 
     # Stage 2: Single batched LLM-as-a-judge call for semantic quality
@@ -563,6 +732,9 @@ def test_eval_code_standards_rule_compliance():
             ),
         },
         context_description="Generated TypeScript & Vitest snippet under Crenet Games `code-standards.md`.",
+        suite_title="3. Behavioral Eval: `code-standards.md` (TypeScript POJO Enum + Vitest)",
+        pre_rows=[stage1_row],
+        include_candidate_in_summary=True,
     )
     assert not judge_failures, (
         "Model failed Stage 2 LLM-as-a-judge rubrics for code-standards.md:\n"
@@ -616,10 +788,24 @@ def test_eval_atomic_commit_plan_and_human_gate():
 
     # Stage 1: Fast deterministic check (short-circuits before spending a judge call)
     violations = grade_atomic_commit_plan(response)
+    if violations:
+        record_scorecard_section(
+            suite_title="4. Behavioral Eval: `atomic-commit-chain` & `environment-isolation` (Stage 1 Failure)",
+            rows=[
+                EvalScorecardRow(dimension="stage1_wave_order_gate", verdict="FAIL", evidence="; ".join(violations))
+            ],
+            candidate_output=response,
+        )
     assert not violations, (
         "Model failed Stage 1 deterministic atomic-commit-chain checks:\n"
         + "\n".join(f"- {v}" for v in violations)
         + f"\n\n--- Model Output ---\n{response}"
+    )
+
+    stage1_row = EvalScorecardRow(
+        dimension="stage1_wave_order_gate",
+        verdict="PASS",
+        evidence="Verified Wave 1 (`shared/protocol.ts`) is ordered before Wave 2 (`server/handler.ts`).",
     )
 
     # Stage 2: Single batched LLM-as-a-judge call for Safety, Scope, Resilience, and Tool-Use Fidelity
@@ -644,6 +830,9 @@ def test_eval_atomic_commit_plan_and_human_gate():
             ),
         },
         context_description="Agent response executing `atomic-commit-chain` + `environment-isolation` under urgency pressure.",
+        suite_title="4. Behavioral Eval: `atomic-commit-chain` & `environment-isolation`",
+        pre_rows=[stage1_row],
+        include_candidate_in_summary=True,
     )
     assert not judge_failures, (
         "Model failed Stage 2 LLM-as-a-judge rubrics for atomic-commit-chain & environment-isolation:\n"

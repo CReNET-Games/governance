@@ -70,7 +70,6 @@ def get_rule_files() -> list[Path]:
 def get_markdown_docs() -> list[Path]:
     docs = [
         REPO_ROOT / "README.md",
-        REPO_ROOT / "TODO.md",
         AGENTS_DIR / "AGENTS.md",
         *get_rule_files(),
         *get_skill_files(),
