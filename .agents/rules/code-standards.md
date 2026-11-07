@@ -37,4 +37,5 @@ The following guidelines apply to code structure, UI template patterns, TypeScri
 - **Sensitive Configuration**: Sensitive deployment scripts and passphrases are excluded via `.gitignore`. Never commit secrets.
 
 ## 5. Testing Standards
-- **Parameterized Tests (Jest)**: Strongly prefer `test.each` or `describe.each` when writing tests with multiple input/output cases to keep tests DRY and readable.
+- **Parameterized Tests (Jest / Vitest)**: Strongly prefer table-driven tests using `test.each`, `it.each`, or `describe.each` when testing multiple input/output cases, boundary conditions, or state transitions to keep test suites DRY and readable.
+- **Reusable Fixture Factories**: Define and share composable factory functions (e.g., `createPlayer(overrides)`, `createWorldState(overrides)`) with sensible defaults instead of scattering repetitive inline object literals or duplicating ad-hoc test helper setup across test files.

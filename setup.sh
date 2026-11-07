@@ -46,7 +46,8 @@ if [ "$1" == "--clean" ] || [ "$1" == "--uninstall" ]; then
     grep -v "Crenet Governance Rules" "$PARENT_AGENTS" | \
     grep -v "Studio Governance Standards" | \
     grep -v "inherits global Crenet Games standards" | \
-    grep -v "\.agents/rules/governance" > "$tmp_agents" || true
+    grep -v "\.agents/rules/governance" | \
+    sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' > "$tmp_agents" || true
     mv "$tmp_agents" "$PARENT_AGENTS"
     echo "✔ Cleaned governance references from parent AGENTS.md"
   fi
@@ -151,30 +152,48 @@ if [ "$SCRIPT_DIR" != "$PARENT_DIR" ]; then
   # 6. Handle parent repository AGENTS.md integration
   PARENT_AGENTS="$PARENT_DIR/AGENTS.md"
   GOV_IMPORT_STUB="<!-- Crenet Governance Rules -->"
-  
-  if [ -f "$PARENT_AGENTS" ]; then
-    if ! grep -q "Crenet Governance Rules" "$PARENT_AGENTS"; then
-      echo "" >> "$PARENT_AGENTS"
-      echo "$GOV_IMPORT_STUB" >> "$PARENT_AGENTS"
-      echo "## Studio Governance Standards" >> "$PARENT_AGENTS"
-      echo "This project inherits global Crenet Games standards from the \`governance\` submodule:" >> "$PARENT_AGENTS"
-      echo "- See [.agents/rules/governance/](.agents/rules/governance/) for active studio rules." >> "$PARENT_AGENTS"
-      echo "✔ Appended governance rule index to existing parent AGENTS.md"
-    fi
-  else
+
+  if [ ! -f "$PARENT_AGENTS" ]; then
     cat << 'EOF' > "$PARENT_AGENTS"
 # Project Agent Guidelines
 
 This repository uses Crenet Games governance standards.
 
-## Studio Governance Standards
-This project inherits global Crenet Games standards from the `governance` submodule:
-- See [.agents/rules/governance/](.agents/rules/governance/) for active studio rules.
-
 ## Project-Specific Guidelines
 Add game-specific directives and rules below.
 EOF
+    CREATED_AGENTS=true
+  else
+    CREATED_AGENTS=false
+  fi
+
+  tmp_agents=$(mktemp)
+  grep -v "Crenet Governance Rules" "$PARENT_AGENTS" | \
+  grep -v "Studio Governance Standards" | \
+  grep -v "inherits global Crenet Games standards" | \
+  grep -v "\.agents/rules/governance" | \
+  sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' > "$tmp_agents" || true
+
+  {
+    cat "$tmp_agents"
+    echo ""
+    echo "$GOV_IMPORT_STUB"
+    echo "## Studio Governance Standards"
+    echo "This project inherits global Crenet Games standards from the \`governance\` submodule:"
+    for rule_file in "$SCRIPT_DIR/.agents/rules/"*.md; do
+      if [ -f "$rule_file" ]; then
+        rule_filename="$(basename "$rule_file")"
+        rule_name="${rule_filename%.md}"
+        echo "- @[$rule_name](.agents/rules/governance/$rule_filename)"
+      fi
+    done
+  } > "$PARENT_AGENTS"
+  rm -f "$tmp_agents"
+
+  if [ "$CREATED_AGENTS" = true ]; then
     echo "✔ Created parent AGENTS.md referencing studio governance standards."
+  else
+    echo "✔ Synchronized governance rule index in parent AGENTS.md"
   fi
 fi
 
