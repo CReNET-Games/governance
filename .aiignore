@@ -1,0 +1,51 @@
+# Crenet Games Canonical AI Agent & Search Ignore (.aiignore)
+# Managed via governance submodule (`./governance/setup.sh`).
+# Vendor-specific ignore files (.geminiignore, .aiexclude, .cursorignore, .claudeignore,
+# .clineignore, .rooignore, .aiderignore, .codeiumignore, .rgignore) symlink to `.aiignore`.
+
+# Dependencies & Virtual Environments
+node_modules/
+**/node_modules/
+.venv/
+**/.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Build & Bundle Outputs
+dist/
+**/dist/
+build/
+**/build/
+.next/
+out/
+coverage/
+**/coverage/
+*.js.map
+*.d.ts.map
+*.tsbuildinfo
+
+# Lockfiles (high-token noise for AI context indexers)
+package-lock.json
+**/package-lock.json
+pnpm-lock.yaml
+yarn.lock
+uv.lock
+**/uv.lock
+
+# Binary Archives, Scratch Captures & Media Blobs
+*.zip
+*.mp4
+*.webm
+*.ogg
+*.wav
+artifacts/storefront/*
+!artifacts/storefront/README.md
+
+# Secrets & Local State
+.env
+.env.*
+!.env.example
+.TODO
+TODO.md
+.git/

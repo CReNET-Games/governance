@@ -5,6 +5,7 @@ This file defines the primary agent rules and directives for all Crenet Games re
 ## Active Rules (`.agents/rules/`)
 
 - **[Code & Infrastructure Standards](rules/code-standards.md)**: Guidelines for HTML templates, semantic CSS, TypeScript POJO enums, Makefile orchestration, and Jest/Vitest tests.
+- **[Agent Execution & Search Speed Standards](rules/agent-execution-speed.md)**: Enforces parallel 800-line `read_file` batching, `.aiignore` symlink conventions, `git grep`/`rg` over raw `grep`, and fast inner-loop test/typecheck verification.
 - **[environment-isolation](rules/environment-isolation.md)**: Pre-commit strict environment isolation checks & Git config email validation.
 
 ## Active Skills (`.agents/skills/` & `.claude/skills/`)

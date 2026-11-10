@@ -7,6 +7,18 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PARENT_DIR="$(dirname "$SCRIPT_DIR")"
 
+AI_IGNORE_SYMLINKS=(
+  ".geminiignore"
+  ".aiexclude"
+  ".cursorignore"
+  ".claudeignore"
+  ".clineignore"
+  ".rooignore"
+  ".aiderignore"
+  ".codeiumignore"
+  ".rgignore"
+)
+
 # Uninstall / Clean mode
 if [ "$1" == "--clean" ] || [ "$1" == "--uninstall" ]; then
   echo "Cleaning governance symlinks and .gitignore in: $PARENT_DIR"
@@ -24,6 +36,11 @@ if [ "$1" == "--clean" ] || [ "$1" == "--uninstall" ]; then
   rm -f "$PARENT_DIR/.antigravity"
   rm -f "$PARENT_DIR/.agents/hooks.json"
   rm -rf "$PARENT_DIR/.claude"
+  for ignore_link in "${AI_IGNORE_SYMLINKS[@]}"; do
+    if [ -L "$PARENT_DIR/$ignore_link" ]; then
+      rm -f "$PARENT_DIR/$ignore_link"
+    fi
+  done
   echo "✔ Governance symlinks cleaned."
 
   # Clean .gitignore entries
@@ -34,7 +51,16 @@ if [ "$1" == "--clean" ] || [ "$1" == "--uninstall" ]; then
     grep -v "\.agents/rules/governance" | \
     grep -v "\.agents/hooks.json" | \
     grep -v "\.claude/" | \
-    grep -v "\.agents/skills/" > "$tmp_gitignore" || true
+    grep -v "\.agents/skills/" | \
+    grep -v "\.geminiignore" | \
+    grep -v "\.aiexclude" | \
+    grep -v "\.cursorignore" | \
+    grep -v "\.claudeignore" | \
+    grep -v "\.clineignore" | \
+    grep -v "\.rooignore" | \
+    grep -v "\.aiderignore" | \
+    grep -v "\.codeiumignore" | \
+    grep -v "\.rgignore" > "$tmp_gitignore" || true
     mv "$tmp_gitignore" "$PARENT_GITIGNORE"
     echo "✔ Cleaned governance entries from parent .gitignore"
   fi
@@ -101,6 +127,18 @@ if [ "$SCRIPT_DIR" != "$PARENT_DIR" ]; then
     echo "✔ Linked Claude hooks -> $PARENT_DIR/.claude"
   fi
 
+  # 3c. Canonical .aiignore + Agent Ignore Symlinks
+  if [ -f "$SCRIPT_DIR/.aiignore" ] && [ ! -f "$PARENT_DIR/.aiignore" ]; then
+    cp "$SCRIPT_DIR/.aiignore" "$PARENT_DIR/.aiignore"
+    echo "✔ Created canonical .aiignore in $PARENT_DIR/.aiignore"
+  fi
+  if [ -f "$PARENT_DIR/.aiignore" ]; then
+    for ignore_link in "${AI_IGNORE_SYMLINKS[@]}"; do
+      ln -sfn ".aiignore" "$PARENT_DIR/$ignore_link"
+    done
+    echo "✔ Linked agent ignore symlinks (${AI_IGNORE_SYMLINKS[*]}) -> .aiignore"
+  fi
+
   # 4. Cleanup Orphan / Broken Symlinks to Governance
   if [ -d "$PARENT_DIR/.agents/rules" ]; then
     find "$PARENT_DIR/.agents/rules" -maxdepth 2 -type l | while read -r link; do
@@ -130,7 +168,16 @@ if [ "$SCRIPT_DIR" != "$PARENT_DIR" ]; then
   grep -v "\.agents/rules/governance" | \
   grep -v "\.agents/hooks.json" | \
   grep -v "\.claude/" | \
-  grep -v "\.agents/skills/" > "$tmp_gi" || true
+  grep -v "\.agents/skills/" | \
+  grep -v "\.geminiignore" | \
+  grep -v "\.aiexclude" | \
+  grep -v "\.cursorignore" | \
+  grep -v "\.claudeignore" | \
+  grep -v "\.clineignore" | \
+  grep -v "\.rooignore" | \
+  grep -v "\.aiderignore" | \
+  grep -v "\.codeiumignore" | \
+  grep -v "\.rgignore" > "$tmp_gi" || true
 
   {
     cat "$tmp_gi"
@@ -144,6 +191,9 @@ if [ "$SCRIPT_DIR" != "$PARENT_DIR" ]; then
         skill_name="$(basename "$skill_dir")"
         echo ".agents/skills/$skill_name"
       fi
+    done
+    for ignore_link in "${AI_IGNORE_SYMLINKS[@]}"; do
+      echo "$ignore_link"
     done
   } > "$PARENT_GITIGNORE"
   rm -f "$tmp_gi"
