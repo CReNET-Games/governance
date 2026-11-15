@@ -1,39 +1,19 @@
 {
-  "name": "CrenetGovernance",
-  "version": "0.1.0",
-  "description": "Centralized governance, compliance, and legal audit layer for Crenet Games repositories.",
-  "server": {
-    "entrypoint": "mcp-server/server.py:mcp",
-    "transport": "stdio"
+  "$schema": "https://gofastmcp.com/public/schemas/fastmcp.json/v1.json",
+  "source": {
+    "path": "mcp-server/server.py",
+    "entrypoint": "mcp"
   },
   "environment": {
-    "CRENET_ENV": "development",
-    "ASSETS_LEDGER_PATH": "./docs/assets_ledger.json"
+    "type": "uv",
+    "python": ">=3.12",
+    "dependencies": [
+      "fastmcp>=4.1.6",
+      "mcp>=2.3.0"
+    ]
   },
-  "tools": [
-    {
-      "name": "log_ai_asset",
-      "description": "Logs an AI-generated asset into the active workspace's ./docs/assets_ledger.json for Steam AI disclosure and copyright defense."
-    },
-    {
-      "name": "verify_environment_isolation",
-      "description": "Verifies active workspace compliance with strict container and network isolation protocols (git user email verification and unauthorized network profile detection)."
-    },
-    {
-      "name": "atomic_commit_status",
-      "description": "Inspects dirty/untracked files, hunk counts, static import graph, and topological commit waves for an atomic commit chain."
-    },
-    {
-      "name": "atomic_commit_hunks",
-      "description": "Lists numbered diff hunks for a file to prepare non-interactive partial staging."
-    },
-    {
-      "name": "atomic_commit_stage",
-      "description": "Non-interactively stages full files and/or specific numbered hunks into the Git index."
-    },
-    {
-      "name": "atomic_commit_verify",
-      "description": "Deterministically verifies that the staged slice (HEAD + index) has no unstaged dependencies and passes checks in an isolated worktree."
-    }
-  ]
+  "deployment": {
+    "transport": "stdio",
+    "log_level": "WARNING"
+  }
 }

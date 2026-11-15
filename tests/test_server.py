@@ -1,252 +1,128 @@
-"""Unit tests for Crenet Core Standards MCP Governance Server."""
+"""Tests for mcp-server/server.py FastMCP governance tools."""
 
-json = __import__("json")
+from __future__ import annotations
+
+import asyncio
+import json
 import os
-from pathlib import Path
 import subprocess
-from unittest.mock import MagicMock, patch
+import sys
+from pathlib import Path
+
 import pytest
 
-from server import (
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../mcp-server")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../scripts")))
+
+import server  # noqa: E402
+from server import (  # noqa: E402
     atomic_commit_hunks,
     atomic_commit_stage,
     atomic_commit_status,
     atomic_commit_verify,
-    log_ai_asset,
-    verify_environment_isolation,
+    audit_asset_provenance,
+    log_asset_provenance,
+    mcp,
+    move_asset_provenance,
 )
 
 
-def call_fn(tool, *args, **kwargs):
-    """Helper to invoke underlying tool function in FastMCP."""
-    fn = getattr(tool, "fn", tool)
+def call_fn(tool_or_fn, *args, **kwargs):
+    fn = getattr(tool_or_fn, "fn", tool_or_fn)
     return fn(*args, **kwargs)
 
 
-def test_log_ai_asset_creates_workspace_docs_ledger_hybrid_pipeline(tmp_path: Path):
-    """Verifies log_ai_asset records full hybrid pipeline metadata in ./docs/assets_ledger.json."""
-    with patch("os.getcwd", return_value=str(tmp_path)):
-        result = call_fn(
-            log_ai_asset,
-            file_name="caelum_texture.png",
-            generation_type="sketch_to_ai_to_post_edit",
-            base_human_sketch_ref="sketches/caelum_01.png",
-            ai_prompt_used="hyperrealistic game texture armor detail",
-            ai_model_used="Stable Diffusion XL",
-            ai_seed="424242",
-            human_source_file_ref="art/caelum_texture.psd",
-            human_modification_description="repainted cockpit highlights and adjusted silhouette",
-        )
-
-        expected_ledger = tmp_path / "docs" / "assets_ledger.json"
-        assert expected_ledger.exists()
-        assert "Successfully logged AI asset" in result
-        assert "sketch_to_ai_to_post_edit" in result
-
-        with open(expected_ledger, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        assert len(data) == 1
-        entry = data[0]
-        assert entry["file_name"] == "caelum_texture.png"
-        assert entry["generation_type"] == "sketch_to_ai_to_post_edit"
-        assert entry["base_human_sketch_ref"] == "sketches/caelum_01.png"
-        assert entry["ai_generation_data"]["prompt"] == "hyperrealistic game texture armor detail"
-        assert entry["ai_generation_data"]["model_used"] == "Stable Diffusion XL"
-        assert entry["ai_generation_data"]["seed"] == "424242"
-        assert entry["human_post_edit_data"]["source_file_ref"] == "art/caelum_texture.psd"
-        assert (
-            entry["human_post_edit_data"]["modification_description"]
-            == "repainted cockpit highlights and adjusted silhouette"
-        )
-        assert "timestamp_utc" in entry
+def test_mcp_server_exposes_expected_tools_only():
+    tools = asyncio.run(mcp.list_tools())
+    names = {t.name for t in tools}
+    assert {
+        "log_asset_provenance",
+        "move_asset_provenance",
+        "audit_asset_provenance",
+        "atomic_commit_status",
+        "atomic_commit_hunks",
+        "atomic_commit_stage",
+        "atomic_commit_verify",
+    } <= names
+    assert "verify_environment_isolation" not in names
+    assert "log_ai_asset" not in names
+    assert not hasattr(server, "verify_environment_isolation")
+    assert not hasattr(server, "log_ai_asset")
 
 
-def test_log_ai_asset_invalid_generation_type():
-    """Verifies ValueError is raised for unrecognized generation_type."""
-    with pytest.raises(ValueError) as exc_info:
-        call_fn(log_ai_asset, file_name="asset.png", generation_type="invalid_type")
-    assert "Invalid generation_type 'invalid_type'" in str(exc_info.value)
+def test_log_and_move_and_audit_asset_provenance_lifecycle(tmp_path: Path):
+    draft = tmp_path / "artifacts/storefront/keyart_raw.png"
+    draft.parent.mkdir(parents=True)
+    draft.write_bytes(b"raw-keyart-bytes")
 
-
-@pytest.mark.parametrize(
-    "cmd_mock_responses, expected_docs_dir_name",
-    [
-        (
-            {("git", "rev-parse", "--show-superproject-working-tree"): "{tmp_path}/superproject\n"},
-            "superproject/docs",
-        ),
-        (
+    logged = call_fn(
+        log_asset_provenance,
+        asset_path="artifacts/storefront/keyart_raw.png",
+        steps=[
             {
-                ("git", "rev-parse", "--show-superproject-working-tree"): "\n",
-                ("git", "rev-parse", "--show-toplevel"): "{tmp_path}/git_root\n",
-            },
-            "git_root/docs",
-        ),
-        (
-            Exception("git not found"),
-            "docs",
-        ),
-    ],
-    ids=["superproject", "toplevel_fallback", "getcwd_fallback"],
-)
-def test_log_ai_asset_workspace_resolution(
-    tmp_path: Path, cmd_mock_responses, expected_docs_dir_name
-):
-    """Verifies that the ledger is written to the correctly resolved workspace."""
+                "actor": "ai",
+                "tool": "gemini-imagen",
+                "prompt": "Ligne claire void black corridor with cyan extraction silo",
+                "summary": "Initial AI composition.",
+            }
+        ],
+        workspace_dir=str(tmp_path),
+    )
+    assert logged["ai_involvement"] == "generated"
+    assert len(logged["sha256"]) == 64
 
-    def mock_subprocess_run(cmd, *args, **kwargs):
-        if isinstance(cmd_mock_responses, Exception):
-            raise cmd_mock_responses
+    published = tmp_path / "client/public/og-banner-1200x630.png"
+    published.parent.mkdir(parents=True)
+    draft.rename(published)
 
-        cmd_tuple = tuple(cmd)
-        if cmd_tuple in cmd_mock_responses:
-            return MagicMock(
-                stdout=cmd_mock_responses[cmd_tuple].format(tmp_path=str(tmp_path)), returncode=0
-            )
-        return MagicMock(stdout="", returncode=0)
+    moved = call_fn(
+        move_asset_provenance,
+        old_path="artifacts/storefront/keyart_raw.png",
+        new_path="client/public/og-banner-1200x630.png",
+        actor="human",
+        tool="GIMP",
+        summary="Cropped to 1200x630 and added Rajdhani typography.",
+        workspace_dir=str(tmp_path),
+    )
+    assert moved["asset_path"] == "client/public/og-banner-1200x630.png"
+    assert moved["previous_paths"] == ["artifacts/storefront/keyart_raw.png"]
+    assert moved["ai_involvement"] == "assisted"
 
-    with patch("os.getcwd", return_value=str(tmp_path)), patch(
-        "subprocess.run", side_effect=mock_subprocess_run
-    ):
-        call_fn(log_ai_asset, file_name="asset.png", generation_type="pure_ai")
-
-        expected_docs_path = tmp_path / expected_docs_dir_name
-        assert (expected_docs_path / "assets_ledger.json").exists()
+    audit = call_fn(audit_asset_provenance, workspace_dir=str(tmp_path))
+    assert audit["ok"] is True
+    assert audit["report"]["counts"]["ai_involvement"]["assisted"] == 1
+    assert "Asset Provenance Scorecard" in audit["scorecard_markdown"]
 
 
-def test_log_ai_asset_explicit_workspace_dir_overrides_daemon_cwd(tmp_path: Path):
-    """Verifies explicit workspace_dir writes ledger to target game repo rather than MCP daemon cwd."""
-    daemon_cwd = tmp_path / "governance_daemon"
-    target_project = tmp_path / "xtractvania"
-    daemon_cwd.mkdir()
-    target_project.mkdir()
-
-    with patch("os.getcwd", return_value=str(daemon_cwd)), patch(
-        "subprocess.run", return_value=MagicMock(stdout="", returncode=0)
-    ):
+def test_log_asset_provenance_rejects_invalid_steps(tmp_path: Path):
+    with pytest.raises(ValueError):
         call_fn(
-            log_ai_asset,
-            file_name="client/public/assets/bg.png",
-            generation_type="pure_ai",
-            workspace_dir=str(target_project),
+            log_asset_provenance,
+            asset_path="bad.png",
+            steps=[{"actor": "ai", "tool": "Imagen", "summary": "Missing prompt"}],
+            workspace_dir=str(tmp_path),
         )
 
-    assert (target_project / "docs" / "assets_ledger.json").exists()
-    assert not (daemon_cwd / "docs" / "assets_ledger.json").exists()
 
-
-@pytest.mark.parametrize(
-    "compliant_email",
-    [
-        "developer@crenet.games",
-        "artist@crenet.games",
-    ],
-)
-def test_verify_environment_isolation_compliant_emails(compliant_email: str):
-    """Verifies that allowed Crenet emails pass the environment isolation check."""
-
-    def mock_subprocess_run(cmd, *args, **kwargs):
-        if cmd[:3] == ["git", "config", "user.email"]:
-            return MagicMock(stdout=f"{compliant_email}\n", returncode=0)
-        if cmd[:2] == ["ps", "aux"]:
-            return MagicMock(stdout="root 1 0.0 bash\n", returncode=0)
-        return MagicMock(stdout="", returncode=0)
-
-    with patch("subprocess.run", side_effect=mock_subprocess_run):
-        result = call_fn(verify_environment_isolation)
-        assert "Environment Isolation Check Passed" in result
-        assert compliant_email in result
-
-
-def test_verify_environment_isolation_blocks_corporate_email():
-    """Verifies that non-compliant git emails raise RuntimeError."""
-
-    def mock_subprocess_run(cmd, *args, **kwargs):
-        if cmd[:3] == ["git", "config", "user.email"]:
-            return MagicMock(stdout="employee@bigcorp-consulting.com\n", returncode=0)
-        return MagicMock(stdout="", returncode=0)
-
-    with patch("subprocess.run", side_effect=mock_subprocess_run):
-        with pytest.raises(RuntimeError) as exc_info:
-            call_fn(verify_environment_isolation)
-        assert "Environment Isolation Violation: Git email" in str(exc_info.value)
-        assert "employee@bigcorp-consulting.com" in str(exc_info.value)
-
-
-def test_verify_environment_isolation_blocks_active_network_profile():
-    """Verifies that detected unauthorized network processes raise RuntimeError."""
-
-    def mock_subprocess_run(cmd, *args, **kwargs):
-        if cmd[:3] == ["git", "config", "user.email"]:
-            return MagicMock(stdout="developer@crenet.games\n", returncode=0)
-        if cmd[:2] == ["ps", "aux"]:
-            return MagicMock(
-                stdout="user 1234 1.0 /opt/cisco/anyconnect/bin/vpnagentd\n", returncode=0
-            )
-        return MagicMock(stdout="", returncode=0)
-
-    with patch("subprocess.run", side_effect=mock_subprocess_run):
-        with pytest.raises(RuntimeError) as exc_info:
-            call_fn(verify_environment_isolation)
-        assert "unauthorized network profile" in str(exc_info.value).lower()
-
-
-def test_mcp_atomic_commit_tools_end_to_end(tmp_path: Path):
-    """Verifies the 4 MCP atomic_commit_* tools delegate cleanly to scripts/atomic_commit.py."""
-    repo = tmp_path / "game_repo"
+def test_atomic_commit_mcp_tools_workflow(tmp_path: Path):
+    repo = tmp_path / "mcp_repo"
     repo.mkdir()
     subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "dev@crenet.games"],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test Dev"],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "commit.gpgsign", "false"],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-    )
+    subprocess.run(["git", "config", "user.email", "dev@crenet.games"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Dev"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=repo, check=True)
+    (repo / "README.md").write_text("# Init\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
 
-    base_file = repo / "shared.ts"
-    base_file.write_text("export const A = 1;\n", encoding="utf-8")
-    subprocess.run(["git", "add", "shared.ts"], cwd=repo, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "chore: init"], cwd=repo, check=True, capture_output=True
-    )
+    (repo / "shared.ts").write_text("export const X = 1;\n", encoding="utf-8")
+    (repo / "app.ts").write_text("import { X } from './shared';\nconsole.log(X);\n", encoding="utf-8")
 
-    # Modify shared.ts and add server.ts importing shared.ts
-    base_file.write_text("export const A = 1;\nexport const B = 2;\n", encoding="utf-8")
-    (repo / "server.ts").write_text("import { B } from './shared';\n", encoding="utf-8")
+    status = call_fn(atomic_commit_status, workspace_dir=str(repo))
+    assert status["topological_waves"] == [["shared.ts"], ["app.ts"]]
 
-    # 1. atomic_commit_status
-    status_res = call_fn(atomic_commit_status, workspace_dir=str(repo))
-    assert status_res["total_dirty_files"] == 2
-    assert status_res["topological_waves"] == [["shared.ts"], ["server.ts"]]
-
-    # 2. atomic_commit_hunks
-    hunks_res = call_fn(atomic_commit_hunks, workspace_dir=str(repo), file="shared.ts")
-    assert hunks_res["hunk_count"] == 1
-    assert "+export const B = 2;" in hunks_res["hunks"][0]["preview"]
-
-    # 3. atomic_commit_stage (stage shared.ts hunk 1)
-    stage_res = call_fn(
-        atomic_commit_stage,
-        workspace_dir=str(repo),
-        hunks=["shared.ts:1"],
-        reset=True,
-    )
-    assert stage_res["staged_files"] == ["shared.ts"]
-
-    # 4. atomic_commit_verify
-    verify_res = call_fn(atomic_commit_verify, workspace_dir=str(repo))
-    assert verify_res["passed"] is True
-    assert verify_res["staged_files"] == ["shared.ts"]
+    call_fn(atomic_commit_stage, workspace_dir=str(repo), files=["shared.ts"], reset=True)
+    verify = call_fn(atomic_commit_verify, workspace_dir=str(repo), skip_worktree=True)
+    assert verify["passed"] is True
+    hunks = call_fn(atomic_commit_hunks, workspace_dir=str(repo), file="shared.ts", cached=True)
+    assert "hunk_count" in hunks

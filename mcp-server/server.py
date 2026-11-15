@@ -1,266 +1,149 @@
-"""Crenet Games Core Standards MCP Server.
+#!/usr/bin/env python3
+"""CrenetGovernance FastMCP server.
 
-Provides centralized governance, compliance checks, legal paper trail logging,
-and deterministic atomic commit chain orchestration for human developers and
-AI Agents operating across Crenet Games repositories.
+Exposes asset provenance tools (`log_asset_provenance`, `move_asset_provenance`,
+`audit_asset_provenance`) and atomic commit workflow tools (`atomic_commit_*`).
 """
 
-from datetime import datetime, timezone
-import json
-import os
-from pathlib import Path
-import subprocess
+from __future__ import annotations
+
 import sys
-from typing import List, Optional
+from pathlib import Path
+from typing import Any, List, Optional
 
-try:
-    from fastmcp import FastMCP
-except ImportError:
-    from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
-# Ensure scripts/ directory is importable for Single Source of Truth delegation
-_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
-if str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR))
+REPO_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+if str(REPO_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_SCRIPTS_DIR))
 
-import atomic_commit
+import atomic_commit  # noqa: E402
+import ledger  # noqa: E402
 
-# Instantiate the central Model Context Protocol server for Crenet Games
 mcp = FastMCP("CrenetGovernance")
 
-# Approved compliant email domains
-_ALLOWED_DOMAINS_ENV = os.environ.get("ALLOWED_EMAIL_DOMAINS", "@crenet.games")
-APPROVED_EMAIL_DOMAINS = tuple(
-    domain.strip().lower() for domain in _ALLOWED_DOMAINS_ENV.split(",") if domain.strip()
-)
 
-# Restricted network indicators to flag in process scans
-_RESTRICTED_NETWORK_ENV = os.environ.get(
-    "RESTRICTED_NETWORK_PROFILES",
-    "cisco,anyconnect,globalprotect,zscaler,pulse,forticlient",
-)
-RESTRICTED_NETWORK_KEYWORDS = tuple(
-    kw.strip().lower() for kw in _RESTRICTED_NETWORK_ENV.split(",") if kw.strip()
-)
-
-# Allowed generation pipeline methodologies
-VALID_GENERATION_TYPES = {
-    "pure_ai",
-    "sketch_to_ai",
-    "ai_to_post_edit",
-    "sketch_to_ai_to_post_edit",
-}
-
-
-def _resolve_target_workspace(
-    workspace_dir: Optional[str] = None,
-    file_hint: Optional[str] = None,
-) -> Path:
-    """Resolve the active target repository root, avoiding the MCP daemon's cwd trap."""
-    if workspace_dir:
-        base_dir = Path(workspace_dir).resolve()
-    elif file_hint and Path(file_hint).is_absolute():
-        hint_path = Path(file_hint).resolve()
-        base_dir = hint_path if hint_path.is_dir() else hint_path.parent
-    else:
-        base_dir = Path(os.getcwd()).resolve()
-
+def _resolve_workspace(workspace_dir: str = ".") -> Path:
+    resolved = Path(workspace_dir).resolve()
     try:
-        res = subprocess.run(
-            ["git", "rev-parse", "--show-superproject-working-tree"],
-            cwd=base_dir,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        super_project = res.stdout.strip()
-        if super_project:
-            return Path(super_project).resolve()
-
-        res = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=base_dir,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        git_root = res.stdout.strip()
-        if git_root:
-            return Path(git_root).resolve()
+        return atomic_commit.get_repo_root(resolved)
     except Exception:
-        pass
-
-    return base_dir
+        return resolved
 
 
 @mcp.tool()
-def log_ai_asset(
-    file_name: str,
-    generation_type: str = "sketch_to_ai_to_post_edit",
-    base_human_sketch_ref: Optional[str] = None,
-    ai_prompt_used: Optional[str] = None,
-    ai_model_used: Optional[str] = None,
-    ai_seed: Optional[str] = None,
-    human_source_file_ref: Optional[str] = None,
-    human_modification_description: Optional[str] = None,
-    workspace_dir: Optional[str] = None,
-) -> str:
-    """Logs an AI-generated asset into the active workspace's docs asset ledger.
+def log_asset_provenance(
+    asset_path: str,
+    steps: List[dict[str, Any]],
+    status: str = "active",
+    notes: Optional[str] = None,
+    previous_paths: Optional[List[str]] = None,
+    append_steps: bool = False,
+    workspace_dir: str = ".",
+) -> dict[str, Any]:
+    """Logs or updates a visual/audio asset's step-by-step provenance recipe in docs/assets_ledger.json.
 
-    Maintains a strict legal paper trail required for Steam AI disclosures,
-    copyright defense, and hybrid human-AI authorship provenance tracking.
-    Writes directly to `./docs/assets_ledger.json` in the target workspace.
+    Supports both published assets and Tier 1 scratch intermediates under `artifacts/`.
+    Computes `ai_involvement` (`none` | `assisted` | `generated`) automatically from `steps`
+    and computes the current SHA-256 hash when the file exists on disk.
 
     Args:
-        file_name: Path or filename of the final shipped asset in the repository.
-        generation_type: Pipeline methodology used ('pure_ai', 'sketch_to_ai', 'ai_to_post_edit', 'sketch_to_ai_to_post_edit').
-        base_human_sketch_ref: Reference path to original concept sketch (for img2img pipelines).
-        ai_prompt_used: Full prompt text used for AI generation.
-        ai_model_used: Optional model identifier (e.g., 'Stable Diffusion XL', 'Midjourney v6').
-        ai_seed: Optional generation seed for reproducibility.
-        human_source_file_ref: Path to layered project file (e.g., .psd, .kra) proving human edits.
-        human_modification_description: Brief summary of human post-edits.
-        workspace_dir: Optional root directory of the target project repository.
+        asset_path: Repository-relative path to the asset file.
+        steps: List of 1..6 ordered provenance step dicts, each with `actor`
+            ('human' | 'ai' | 'procedural'), `tool`, `summary`, and optional
+            `prompt` (required iff `actor == 'ai'`), `artifact_ref`, `sha256`,
+            `seed`, and `license`.
+        status: Asset lifecycle status ('active' or 'deprecated').
+        notes: Optional studio context or licensing notes.
+        previous_paths: Optional prior paths (for assets copied/graduated manually).
+        append_steps: If True, append `steps` to an existing entry's step list.
+        workspace_dir: Path to the target repository root.
 
     Returns:
-        A confirmation message indicating successful recording in the target workspace ledger.
-
-    Raises:
-        ValueError: If generation_type is invalid.
+        The validated v2 ledger entry dictionary persisted to `docs/assets_ledger.json`.
     """
-    if generation_type not in VALID_GENERATION_TYPES:
-        raise ValueError(
-            f"Invalid generation_type '{generation_type}'. Must be one of: {sorted(list(VALID_GENERATION_TYPES))}"
-        )
-
-    active_workspace = _resolve_target_workspace(workspace_dir=workspace_dir, file_hint=file_name)
-    docs_dir = active_workspace / "docs"
-    docs_dir.mkdir(parents=True, exist_ok=True)
-    ledger_path = docs_dir / "assets_ledger.json"
-
-    ledger_entries: List[dict] = []
-    if ledger_path.exists():
-        try:
-            with open(ledger_path, "r", encoding="utf-8") as f:
-                content = json.load(f)
-                if isinstance(content, list):
-                    ledger_entries = content
-        except (json.JSONDecodeError, OSError):
-            ledger_entries = []
-
-    new_entry = {
-        "file_name": file_name,
-        "generation_type": generation_type,
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-    }
-
-    if base_human_sketch_ref:
-        new_entry["base_human_sketch_ref"] = base_human_sketch_ref
-
-    if ai_prompt_used:
-        ai_gen_data = {"prompt": ai_prompt_used}
-        if ai_model_used:
-            ai_gen_data["model_used"] = ai_model_used
-        if ai_seed:
-            ai_gen_data["seed"] = ai_seed
-        new_entry["ai_generation_data"] = ai_gen_data
-
-    if human_source_file_ref and human_modification_description:
-        new_entry["human_post_edit_data"] = {
-            "source_file_ref": human_source_file_ref,
-            "modification_description": human_modification_description,
-        }
-
-    ledger_entries.append(new_entry)
-    with open(ledger_path, "w", encoding="utf-8") as f:
-        json.dump(ledger_entries, f, indent=2, ensure_ascii=False)
-
-    return (
-        f"Successfully logged AI asset '{file_name}' [{generation_type}] to workspace ledger at "
-        f"{ledger_path} [UTC: {new_entry['timestamp_utc']}]."
+    repo = _resolve_workspace(workspace_dir)
+    return ledger.log_asset(
+        repo,
+        asset_path,
+        steps,
+        status=status,
+        notes=notes,
+        previous_paths=previous_paths,
+        append_steps=append_steps,
     )
 
 
 @mcp.tool()
-def verify_environment_isolation(workspace_dir: Optional[str] = None) -> str:
-    """Verifies that the current workspace and execution environment comply with strict container and network isolation protocols.
+def move_asset_provenance(
+    old_path: str,
+    new_path: str,
+    actor: Optional[str] = None,
+    tool: Optional[str] = None,
+    summary: Optional[str] = None,
+    prompt: Optional[str] = None,
+    notes: Optional[str] = None,
+    workspace_dir: str = ".",
+) -> dict[str, Any]:
+    """Graduates or relocates a tracked asset entry while preserving its earlier provenance steps.
 
-    Checks:
-    1. Git user email in the active workspace matches approved domains
-       (default: '@crenet.games', configurable via ALLOWED_EMAIL_DOMAINS).
-    2. Checks that no unauthorized external network bindings or restricted profiles are active in the system process list
-       (configurable via RESTRICTED_NETWORK_PROFILES).
+    Appends `old_path` to `previous_paths`, optionally appends a relocation/conversion step,
+    recomputes `sha256` at `new_path`, and updates `docs/assets_ledger.json`.
 
     Args:
-        workspace_dir: Optional directory path to evaluate. Defaults to current working directory.
+        old_path: Existing repository-relative path in the ledger (e.g. `artifacts/...`).
+        new_path: Destination repository-relative path (e.g. `client/public/...`).
+        actor: Optional step actor for the relocation/conversion step.
+        tool: Optional tool used for conversion/graduation.
+        summary: Optional summary of the graduation/edit step.
+        prompt: Optional prompt if `actor == 'ai'`.
+        notes: Optional replacement notes string.
+        workspace_dir: Path to the target repository root.
 
     Returns:
-        A success message if all airgap compliance checks pass.
-
-    Raises:
-        RuntimeError: If a corporate git email or active unauthorized network profile is detected.
+        The relocated and revalidated v2 ledger entry dictionary.
     """
-    target_dir = Path(workspace_dir).resolve() if workspace_dir else Path(os.getcwd()).resolve()
+    repo = _resolve_workspace(workspace_dir)
+    move_step: Optional[dict[str, Any]] = None
+    if actor or tool or summary:
+        if not (actor and tool and summary):
+            raise ValueError("Provide actor, tool, and summary together when adding a move step.")
+        move_step = {"actor": actor, "tool": tool, "summary": summary}
+        if prompt is not None:
+            move_step["prompt"] = prompt
 
-    # 1. Verify Git Config Email
-    try:
-        res = subprocess.run(
-            ["git", "config", "user.email"],
-            cwd=target_dir,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        git_email = res.stdout.strip().lower()
-    except Exception as exc:
-        raise RuntimeError(
-            f"Environment Isolation Check Error: Failed to execute git config check: {exc}"
-        )
+    return ledger.move_asset(repo, old_path, new_path, step=move_step, notes=notes)
 
-    if not git_email:
-        raise RuntimeError(
-            "Environment Isolation Violation: No Git user.email configured in active workspace. "
-            "Please configure user.email with an authorized Crenet Games address."
-        )
 
-    is_compliant_email = any(git_email.endswith(domain) for domain in APPROVED_EMAIL_DOMAINS)
+@mcp.tool()
+def audit_asset_provenance(
+    workspace_dir: str = ".",
+    paths: Optional[List[str]] = None,
+    strict_hashes: bool = False,
+    include_report: bool = True,
+) -> dict[str, Any]:
+    """Audits repository and artifacts/ assets against docs/assets_ledger.json.
 
-    if not is_compliant_email:
-        raise RuntimeError(
-            f"Environment Isolation Violation: Git email '{git_email}' is non-compliant. "
-            f"Commits are blocked. Expected an email ending in one of: {APPROVED_EMAIL_DOMAINS}."
-        )
+    Detects unlogged active assets, orphan ledger entries, stale SHA-256 digests,
+    and candidate graduation moves, and optionally returns a Publisher/M&A scorecard.
 
-    # 2. Check for active unauthorized network profiles
-    try:
-        ps_res = subprocess.run(
-            ["ps", "aux"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        ps_output = ps_res.stdout.lower()
-        for kw in RESTRICTED_NETWORK_KEYWORDS:
-            if kw in ps_output:
-                raise RuntimeError(
-                    f"Environment Isolation Violation: Unauthorized network profile '{kw}' detected. "
-                    "All code commits and cloud deployments are strictly blocked."
-                )
-    except RuntimeError:
-        raise
-    except Exception:
-        # Fallback check via environment variables if ps aux is unavailable
-        env_str = str(os.environ).lower()
-        for kw in RESTRICTED_NETWORK_KEYWORDS:
-            if kw in env_str:
-                raise RuntimeError(
-                    f"Environment Isolation Violation: Unauthorized network environment indicator '{kw}' detected."
-                )
+    Args:
+        workspace_dir: Path to the target repository root.
+        paths: Optional subset of repository-relative paths to check.
+        strict_hashes: If True, mark stale SHA-256 digests as verification failure.
+        include_report: If True, attach `report` and `scorecard_markdown` fields.
 
-    return (
-        f"Environment Isolation Check Passed: Git email '{git_email}' is compliant and no unauthorized "
-        "network profiles were detected."
-    )
+    Returns:
+        Audit dictionary with `enabled`, `ok`, `unlogged`, `orphan_entries`,
+        `stale_hashes`, `graduation_candidates`, and optional scorecard data.
+    """
+    repo = _resolve_workspace(workspace_dir)
+    result = ledger.verify_ledger(repo, paths=paths, strict_hashes=strict_hashes)
+    if include_report:
+        report = ledger.generate_report(repo)
+        result["report"] = report
+        result["scorecard_markdown"] = ledger.format_report_markdown(report)
+    return result
 
 
 @mcp.tool()
