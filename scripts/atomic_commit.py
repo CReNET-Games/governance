@@ -267,7 +267,116 @@ def _strip_comments(source: str, ext: str) -> str:
     return source
 
 
-def resolve_ts_import(importer_rel: str, specifier: str, candidate_files: set[str]) -> str | None:
+# ---------------------------------------------------------------------------
+# TS/JS & Python static import resolution
+# ---------------------------------------------------------------------------
+
+TS_JSONC_COMMENT_RE = re.compile(r"//[^\n]*|/\*[\s\S]*?\*/")
+TS_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+
+
+def _parse_jsonc(raw: str) -> dict:
+    """Parse JSON with line/block comments and trailing commas (tsconfig.json)."""
+    no_comments = TS_JSONC_COMMENT_RE.sub("", raw)
+    cleaned = TS_TRAILING_COMMA_RE.sub(r"\1", no_comments)
+    data = json.loads(cleaned)
+    return data if isinstance(data, dict) else {}
+
+
+def _load_tsconfig_merged(config_path: Path, seen: set[Path] | None = None) -> dict:
+    """Load a tsconfig.json and recursively resolve relative `extends` chains."""
+    seen = seen or set()
+    resolved = config_path.resolve()
+    if resolved in seen or not resolved.is_file():
+        return {}
+    seen.add(resolved)
+    try:
+        data = _parse_jsonc(resolved.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    merged_opts: dict = {"_base_dir": resolved.parent}
+    extends_val = data.get("extends")
+    if isinstance(extends_val, str) and extends_val.startswith("."):
+        parent_cfg = resolved.parent / extends_val
+        if parent_cfg.suffix != ".json" and (parent_cfg.with_suffix(".json")).is_file():
+            parent_cfg = parent_cfg.with_suffix(".json")
+        parent_opts = _load_tsconfig_merged(parent_cfg, seen)
+        merged_opts.update(parent_opts)
+        if "_base_dir" not in parent_opts:
+            merged_opts["_base_dir"] = resolved.parent
+
+    cur_opts = data.get("compilerOptions")
+    if isinstance(cur_opts, dict):
+        parent_paths = dict(merged_opts.get("paths") or {})
+        cur_paths = cur_opts.get("paths")
+        merged_opts.update(cur_opts)
+        if isinstance(cur_opts.get("baseUrl"), str) and cur_opts["baseUrl"].strip():
+            merged_opts["_base_dir"] = (resolved.parent / cur_opts["baseUrl"]).resolve()
+        if isinstance(cur_paths, dict):
+            parent_paths.update(cur_paths)
+            merged_opts["paths"] = parent_paths
+    return merged_opts
+
+
+def resolve_tsconfig_aliases(repo: Path, importer_rel: str, specifier: str) -> list[Path]:
+    """Expand `compilerOptions.paths` / `baseUrl` from nearest/root tsconfig.json."""
+    importer_abs_dir = (repo / importer_rel).parent
+    search_dirs: list[Path] = []
+    cur = importer_abs_dir
+    repo_res = repo.resolve()
+    while True:
+        search_dirs.append(cur)
+        if cur.resolve() == repo_res or cur == cur.parent:
+            break
+        cur = cur.parent
+
+    candidates: list[Path] = []
+    seen_configs: set[Path] = set()
+    for d in search_dirs:
+        cfg_path = d / "tsconfig.json"
+        if not cfg_path.is_file() or cfg_path.resolve() in seen_configs:
+            continue
+        seen_configs.add(cfg_path.resolve())
+        opts = _load_tsconfig_merged(cfg_path)
+        base_dir = opts.get("_base_dir") or cfg_path.parent
+
+        paths_map = opts.get("paths")
+        if isinstance(paths_map, dict):
+            for pattern, targets in paths_map.items():
+                if not isinstance(targets, list):
+                    continue
+                if "*" in pattern:
+                    prefix, suffix = pattern.split("*", 1)
+                    if specifier.startswith(prefix) and specifier.endswith(suffix):
+                        captured = specifier[len(prefix) : len(specifier) - len(suffix) if suffix else None]
+                        for tgt in targets:
+                            if not isinstance(tgt, str):
+                                continue
+                            mapped = tgt.replace("*", captured)
+                            abs_tgt = (base_dir / mapped).resolve()
+                            try:
+                                candidates.append(abs_tgt.relative_to(repo_res))
+                            except ValueError:
+                                pass
+                elif specifier == pattern:
+                    for tgt in targets:
+                        if not isinstance(tgt, str):
+                            continue
+                        abs_tgt = (base_dir / tgt).resolve()
+                        try:
+                            candidates.append(abs_tgt.relative_to(repo_res))
+                        except ValueError:
+                            pass
+    return candidates
+
+
+def resolve_ts_import(
+    importer_rel: str,
+    specifier: str,
+    candidate_files: set[str],
+    repo: Path | None = None,
+) -> str | None:
     """Resolve a TS/JS import specifier to a repository-relative file path."""
     importer_dir = Path(importer_rel).parent
     possible_bases: list[Path] = []
@@ -275,6 +384,8 @@ def resolve_ts_import(importer_rel: str, specifier: str, candidate_files: set[st
     if specifier.startswith("."):
         possible_bases.append(Path(os.path.normpath(importer_dir / specifier)))
     else:
+        if repo is not None:
+            possible_bases.extend(resolve_tsconfig_aliases(repo, importer_rel, specifier))
         # Handle workspace package or path-alias imports like `@shared/foo` or `shared/foo`
         cleaned = specifier.lstrip("@")
         possible_bases.append(Path(os.path.normpath(cleaned)))
@@ -357,7 +468,10 @@ class ImportedSymbols:
 
 
 def extract_file_imports(
-    rel_path: str, content: str, known_repo_files: set[str]
+    rel_path: str,
+    content: str,
+    known_repo_files: set[str],
+    repo: Path | None = None,
 ) -> dict[str, ImportedSymbols]:
     """Return resolved imports `{target_rel_path: ImportedSymbols}` for `rel_path`."""
     ext = Path(rel_path).suffix.lower()
@@ -367,13 +481,13 @@ def extract_file_imports(
     if ext in TS_JS_EXTENSIONS:
         for m in TS_IMPORT_SPEC_RE.finditer(cleaned):
             spec = m.group(1).strip()
-            target = resolve_ts_import(rel_path, spec, known_repo_files)
+            target = resolve_ts_import(rel_path, spec, known_repo_files, repo=repo)
             if target and target != rel_path:
                 resolved.setdefault(target, ImportedSymbols(target_file=target))
 
         for m in TS_NAMED_IMPORT_RE.finditer(cleaned):
             raw_names, spec = m.group(1), m.group(2).strip()
-            target = resolve_ts_import(rel_path, spec, known_repo_files)
+            target = resolve_ts_import(rel_path, spec, known_repo_files, repo=repo)
             if target and target != rel_path:
                 entry = resolved.setdefault(target, ImportedSymbols(target_file=target))
                 for part in raw_names.split(","):
@@ -461,33 +575,65 @@ class DirtyFileEntry:
     depends_on_dirty: list[str] = field(default_factory=list)
 
 
+def _run_git_bytes(args: list[str], repo: Path) -> bytes:
+    """Run git expecting binary NUL-delimited stdout."""
+    res = subprocess.run(
+        ["git", *args],
+        cwd=str(repo),
+        capture_output=True,
+        check=True,
+    )
+    return res.stdout
+
+
 def get_all_repo_files(repo: Path) -> set[str]:
     """Return all tracked + untracked (non-ignored) files in the repository."""
-    res = run_git(["ls-files", "--cached", "--others", "--exclude-standard"], repo)
-    return {line.strip() for line in res.stdout.splitlines() if line.strip()}
+    raw = _run_git_bytes(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], repo)
+    return {
+        token.decode("utf-8", errors="surrogateescape")
+        for token in raw.split(b"\x00")
+        if token
+    }
 
 
 def get_staged_files(repo: Path) -> dict[str, str]:
     """Return `{path: status_code}` for all files currently staged in the index vs HEAD."""
     if has_head_commit(repo):
-        res = run_git(["diff", "--cached", "--name-status"], repo)
-    else:
-        res = run_git(["status", "--porcelain=v1"], repo)
-        out: dict[str, str] = {}
-        for line in res.stdout.splitlines():
-            if len(line) >= 4 and line[0] not in (" ", "?"):
-                out[line[3:].strip()] = line[0]
-        return out
+        raw = _run_git_bytes(["diff", "--cached", "--name-status", "-z"], repo)
+        tokens = [t.decode("utf-8", errors="surrogateescape") for t in raw.split(b"\x00")]
+        staged: dict[str, str] = {}
+        i = 0
+        while i < len(tokens):
+            status = tokens[i]
+            if not status:
+                i += 1
+                continue
+            code = status[0]
+            if code in ("R", "C") and i + 2 < len(tokens):
+                staged[tokens[i + 2]] = code
+                i += 3
+            elif i + 1 < len(tokens):
+                staged[tokens[i + 1]] = code
+                i += 2
+            else:
+                i += 1
+        return staged
 
-    staged: dict[str, str] = {}
-    for line in res.stdout.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        status = parts[0].strip()
-        path = parts[-1].strip()
-        staged[path] = status[0]
-    return staged
+    raw = _run_git_bytes(["status", "--porcelain=v1", "-z"], repo)
+    tokens = [t.decode("utf-8", errors="surrogateescape") for t in raw.split(b"\x00")]
+    out: dict[str, str] = {}
+    i = 0
+    while i < len(tokens):
+        entry = tokens[i]
+        if len(entry) >= 4:
+            idx_s = entry[0]
+            path = entry[3:]
+            if idx_s not in (" ", "?"):
+                out[path] = idx_s
+            if idx_s in ("R", "C") and i + 1 < len(tokens):
+                i += 1
+        i += 1
+    return out
 
 
 def read_index_blob(repo: Path, rel_path: str) -> str | None:
@@ -540,19 +686,24 @@ def compute_topological_waves(
 
 def inspect_status(repo: Path) -> dict:
     """Inspect working tree + index and build a static dependency report."""
-    res = run_git(["status", "--porcelain=v1", "-uall"], repo)
+    raw = _run_git_bytes(["status", "--porcelain=v1", "-z", "-uall"], repo)
     known_files = get_all_repo_files(repo)
 
     entries: dict[str, DirtyFileEntry] = {}
-    for raw_line in res.stdout.splitlines():
+    tokens = [t.decode("utf-8", errors="surrogateescape") for t in raw.split(b"\x00")]
+    i = 0
+    while i < len(tokens):
+        raw_line = tokens[i]
+        i += 1
         if len(raw_line) < 4:
             continue
         xy = raw_line[:2]
         idx_s, wt_s = xy[0], xy[1]
-        raw_path = raw_line[3:].strip()
-        if " -> " in raw_path:
-            raw_path = raw_path.split(" -> ", 1)[1].strip()
-        rel_path = raw_path.strip('"')
+        rel_path = raw_line[3:]
+        if idx_s in ("R", "C") or wt_s in ("R", "C"):
+            # Consume the original source path emitted immediately after the new path under `-z`
+            if i < len(tokens):
+                i += 1
 
         if xy == "??":
             category = "untracked"
@@ -595,7 +746,7 @@ def inspect_status(repo: Path) -> dict:
             deps_map[rel_path] = []
             continue
 
-        imported = extract_file_imports(rel_path, content, known_files)
+        imported = extract_file_imports(rel_path, content, known_files, repo=repo)
         dirty_deps = sorted(target for target in imported if target in dirty_set)
         entry.depends_on_dirty = dirty_deps
         deps_map[rel_path] = dirty_deps
@@ -619,15 +770,19 @@ CONFLICT_MARKER_RE = re.compile(r"^(<<<<<<< |=======$|>>>>>>> )", re.MULTILINE)
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 
 
-def find_ledger_content(repo: Path) -> str:
-    """Read `assets_ledger.json` if present in the repository."""
-    for candidate in (repo / "docs" / "assets_ledger.json", repo / "assets_ledger.json"):
-        if candidate.is_file():
-            try:
-                return candidate.read_text(encoding="utf-8")
-            except OSError:
-                pass
-    return ""
+def _load_effective_ledger_for_verify(repo: Path, staged: dict[str, str]):
+    """Load validated v2 ledger data, preferring staged docs/assets_ledger.json when staged."""
+    import ledger as asset_ledger
+
+    if not asset_ledger.is_asset_provenance_enabled(repo):
+        return None
+    if asset_ledger.LEDGER_REL_PATH in staged and staged[asset_ledger.LEDGER_REL_PATH] != "D":
+        staged_raw = read_index_blob(repo, asset_ledger.LEDGER_REL_PATH)
+        if staged_raw is not None:
+            data = json.loads(staged_raw)
+            asset_ledger.validate_ledger_data(data)
+            return data
+    return asset_ledger.load_ledger(repo)
 
 
 def verify_staged_slice(
@@ -635,8 +790,11 @@ def verify_staged_slice(
     commands: list[str] | None = None,
     *,
     skip_worktree: bool = False,
+    command_timeout: int = 120,
 ) -> dict:
     """Deterministically verify that the staged slice (`HEAD + index`) is valid and self-contained."""
+    import ledger as asset_ledger
+
     staged = get_staged_files(repo)
     if not staged:
         return {
@@ -648,18 +806,31 @@ def verify_staged_slice(
 
     errors: list[str] = []
     known_files = get_all_repo_files(repo)
-    ledger_content = find_ledger_content(repo)
-    # If assets_ledger.json is itself staged, prefer its staged content!
-    for staged_path in staged:
-        if os.path.basename(staged_path) == "assets_ledger.json":
-            staged_ledger = read_index_blob(repo, staged_path)
-            if staged_ledger is not None:
-                ledger_content = staged_ledger
+
+    effective_ledger = None
+    ledger_error: str | None = None
+    try:
+        effective_ledger = _load_effective_ledger_for_verify(repo, staged)
+    except (asset_ledger.LedgerCorruptError, json.JSONDecodeError, ValueError) as exc:
+        ledger_error = str(exc)
+
+    staged_assets = [
+        p
+        for p, code in sorted(staged.items())
+        if code != "D"
+        and not (repo / p).is_symlink()
+        and Path(p).suffix.lower() in asset_ledger.ASSET_EXTENSIONS
+        and not asset_ledger._is_ignored_path(p, asset_ledger.load_ignore_patterns(repo))
+    ]
+    if ledger_error and (staged_assets or asset_ledger.LEDGER_REL_PATH in staged):
+        errors.append(f"Asset provenance ledger is invalid: {ledger_error}")
 
     # Determine which files have unstaged modifications in the working tree
-    unstaged_res = run_git(["diff", "--name-only"], repo)
+    raw_unstaged = _run_git_bytes(["diff", "--name-only", "-z"], repo)
     unstaged_modified = {
-        line.strip() for line in unstaged_res.stdout.splitlines() if line.strip()
+        tok.decode("utf-8", errors="surrogateescape")
+        for tok in raw_unstaged.split(b"\x00")
+        if tok
     }
 
     # Check 1 & 2: Hygiene + Static Index-vs-Worktree Dependency Isolation
@@ -667,13 +838,17 @@ def verify_staged_slice(
         if status_code == "D" or (repo / rel_path).is_symlink():
             continue
 
-        # Check asset ledger compliance for staged images
-        if rel_path.lower().endswith(IMAGE_EXTENSIONS):
-            basename = os.path.basename(rel_path)
-            if basename not in ledger_content:
-                errors.append(
-                    f"Staged image '{rel_path}' is missing from assets_ledger.json (must be logged via log_ai_asset)."
+        # Check asset ledger compliance for staged images/media
+        if rel_path in staged_assets:
+            if effective_ledger is not None:
+                entry = effective_ledger.get("assets", {}).get(
+                    asset_ledger.normalize_asset_path(rel_path)
                 )
+                if not entry or entry.get("status") != "active":
+                    errors.append(
+                        f"Staged asset '{rel_path}' is missing active provenance in "
+                        f"docs/assets_ledger.json (must be logged via log_asset_provenance)."
+                    )
             continue
 
         staged_content = read_index_blob(repo, rel_path)
@@ -685,7 +860,7 @@ def verify_staged_slice(
             errors.append(f"Staged file '{rel_path}' contains leftover merge conflict markers.")
 
         # Check imports against unstaged/untracked files and partially staged exports
-        imports = extract_file_imports(rel_path, staged_content, known_files)
+        imports = extract_file_imports(rel_path, staged_content, known_files, repo=repo)
         for target_path, imp_info in imports.items():
             target_is_staged = target_path in staged and staged[target_path] != "D"
             target_in_head = file_exists_in_head(repo, target_path)
@@ -729,32 +904,53 @@ def verify_staged_slice(
         try:
             run_git(["worktree", "add", "--detach", str(tmp_dir), commit_sha], repo)
 
-            # Symlink dependency caches (node_modules, .venv) from main repo into ephemeral worktree
+            # Symlink dependency caches (root + subpackage node_modules, .venv) into ephemeral worktree
             for cache_dir in ("node_modules", ".venv"):
                 src_cache = repo / cache_dir
                 dst_cache = tmp_dir / cache_dir
                 if src_cache.exists() and not dst_cache.exists():
                     os.symlink(str(src_cache), str(dst_cache))
+            for child in repo.iterdir():
+                if child.is_dir() and not child.name.startswith("."):
+                    sub_nm = child / "node_modules"
+                    dst_sub = tmp_dir / child.name / "node_modules"
+                    if sub_nm.exists() and (tmp_dir / child.name).is_dir() and not dst_sub.exists():
+                        os.symlink(str(sub_nm), str(dst_sub))
 
             for cmd_str in commands:
-                proc = subprocess.run(
-                    cmd_str,
-                    cwd=str(tmp_dir),
-                    shell=True,
-                    text=True,
-                    capture_output=True,
-                )
-                command_results.append(
-                    {
-                        "command": cmd_str,
-                        "returncode": proc.returncode,
-                        "stdout": proc.stdout,
-                        "stderr": proc.stderr,
-                    }
-                )
-                if proc.returncode != 0:
+                try:
+                    proc = subprocess.run(
+                        cmd_str,
+                        cwd=str(tmp_dir),
+                        shell=True,
+                        text=True,
+                        capture_output=True,
+                        timeout=command_timeout,
+                    )
+                    command_results.append(
+                        {
+                            "command": cmd_str,
+                            "returncode": proc.returncode,
+                            "stdout": proc.stdout,
+                            "stderr": proc.stderr,
+                        }
+                    )
+                    if proc.returncode != 0:
+                        errors.append(
+                            f"Verification command failed (exit {proc.returncode}) in isolated staged worktree: {cmd_str}"
+                        )
+                        break
+                except subprocess.TimeoutExpired as exc:
+                    command_results.append(
+                        {
+                            "command": cmd_str,
+                            "returncode": 124,
+                            "stdout": exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or ""),
+                            "stderr": f"Command timed out after {command_timeout}s",
+                        }
+                    )
                     errors.append(
-                        f"Verification command failed (exit {proc.returncode}) in isolated staged worktree: {cmd_str}"
+                        f"Verification command timed out after {command_timeout}s in isolated staged worktree: {cmd_str}"
                     )
                     break
         finally:
@@ -860,6 +1056,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Only run fast static index-vs-worktree checks without creating a temporary worktree.",
     )
+    p_verify.add_argument(
+        "--timeout",
+        type=int,
+        default=120,
+        help="Per-command timeout in seconds inside the isolated worktree (default: 120).",
+    )
     p_verify.add_argument("--json", action="store_true", help="Output JSON report.")
 
     return parser
@@ -953,6 +1155,7 @@ def main(argv: list[str] | None = None) -> int:
             repo,
             commands=args.cmd,
             skip_worktree=args.skip_worktree,
+            command_timeout=args.timeout,
         )
         if args.json:
             print(json.dumps(report, indent=2))

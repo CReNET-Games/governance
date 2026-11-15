@@ -226,12 +226,35 @@ def test_hunks_and_partial_staging(
         pytest.param(
             {
                 "sprite.png": b"\x89PNG\r\n\x1a\n",
-                "docs/assets_ledger.json": '[{"file_name": "sprite.png"}]',
+                "docs/assets_ledger.json": (
+                    '{\n'
+                    '  "version": 2,\n'
+                    '  "assets": {\n'
+                    '    "sprite.png": {\n'
+                    '      "asset_path": "sprite.png",\n'
+                    '      "status": "active",\n'
+                    '      "ai_involvement": "none",\n'
+                    '      "logged_at": "2026-11-15T00:00:00Z",\n'
+                    '      "steps": [{"actor": "human", "tool": "Aseprite", "summary": "Pixel sprite."}]\n'
+                    '    }\n'
+                    '  }\n'
+                    '}\n'
+                ),
             },
             ["sprite.png", "docs/assets_ledger.json"],
             True,
             [],
-            id="passes_when_staged_image_is_logged_in_ledger",
+            id="passes_when_staged_image_is_logged_in_v2_ledger",
+        ),
+        pytest.param(
+            {
+                "sprite.png": b"\x89PNG\r\n\x1a\n",
+                ".crenet-governance.json": '{"asset_provenance": false}\n',
+            },
+            ["sprite.png", ".crenet-governance.json"],
+            True,
+            [],
+            id="passes_when_asset_provenance_opted_out",
         ),
     ],
 )
@@ -346,3 +369,83 @@ def test_verify_ephemeral_worktree_command_execution(temp_git_repo: Path):
     assert report_pass["passed"] is True
     assert report_pass["command_results"][0]["returncode"] == 0
     assert untracked_note.read_text(encoding="utf-8") == "keep me untouched in worktree\n"
+
+
+def test_tsconfig_paths_extends_and_jsonc_import_resolution(temp_git_repo: Path):
+    """Verifies inspect_status and verify_staged_slice follow tsconfig extends + JSONC path aliases."""
+    (temp_git_repo / "tsconfig.base.json").write_text(
+        '{\n'
+        '  // Base config with trailing comma\n'
+        '  "compilerOptions": {\n'
+        '    "baseUrl": ".",\n'
+        '    "paths": {\n'
+        '      "@shared/*": ["shared/src/*"],\n'
+        '    },\n'
+        '  }\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    (temp_git_repo / "client").mkdir()
+    (temp_git_repo / "client/tsconfig.json").write_text(
+        '{\n  "extends": "../tsconfig.base.json",\n  "compilerOptions": {"paths": {"@ui/*": ["client/src/*"]}}\n}\n',
+        encoding="utf-8",
+    )
+    (temp_git_repo / "shared/src").mkdir(parents=True)
+    (temp_git_repo / "shared/src/types.ts").write_text("export interface Unit { id: string; }\n", encoding="utf-8")
+    (temp_git_repo / "client/src").mkdir(parents=True)
+    (temp_git_repo / "client/src/view.ts").write_text(
+        "import type { Unit } from '@shared/types';\nexport const name = 'ok';\n",
+        encoding="utf-8",
+    )
+
+    status = atomic_commit.inspect_status(temp_git_repo)
+    assert "shared/src/types.ts" in status["topological_waves"][0]
+    assert status["topological_waves"][1] == ["client/src/view.ts"]
+
+    atomic_commit.main(["--repo", str(temp_git_repo), "stage", "--reset", "--files", "client/src/view.ts"])
+    blocked = atomic_commit.verify_staged_slice(temp_git_repo, skip_worktree=True)
+    assert blocked["passed"] is False
+    assert "shared/src/types.ts" in "\n".join(blocked["errors"])
+
+    atomic_commit.main(["--repo", str(temp_git_repo), "stage", "--files", "shared/src/types.ts"])
+    passed = atomic_commit.verify_staged_slice(temp_git_repo, skip_worktree=True)
+    assert passed["passed"] is True
+
+
+def test_verify_symlinks_subpackage_node_modules_and_enforces_timeout(temp_git_repo: Path):
+    """Verifies ephemeral worktree links <subdir>/node_modules and enforces command timeouts."""
+    pkg = temp_git_repo / "client"
+    (pkg / "node_modules" / "fake-dep").mkdir(parents=True)
+    (pkg / "node_modules" / "fake-dep" / "marker.txt").write_text("cached\n", encoding="utf-8")
+    probe = pkg / "probe.py"
+    probe.write_text(
+        "import pathlib, sys\n"
+        "sys.exit(0 if pathlib.Path('client/node_modules/fake-dep/marker.txt').exists() else 1)\n",
+        encoding="utf-8",
+    )
+    atomic_commit.main(["--repo", str(temp_git_repo), "stage", "--reset", "--files", "client/probe.py"])
+
+    ok_res = atomic_commit.verify_staged_slice(temp_git_repo, commands=["python3 client/probe.py"])
+    assert ok_res["passed"] is True
+
+    timeout_res = atomic_commit.verify_staged_slice(
+        temp_git_repo,
+        commands=["python3 -c 'import time; time.sleep(2)'"],
+        command_timeout=1,
+    )
+    assert timeout_res["passed"] is False
+    assert timeout_res["command_results"][0]["returncode"] == 124
+    assert "timed out" in "\n".join(timeout_res["errors"])
+
+
+def test_status_and_stage_handle_spaces_and_unicode_filenames(temp_git_repo: Path):
+    """Verifies -z NUL-delimited Git parsing handles spaces and non-ASCII paths cleanly."""
+    spaced = temp_git_repo / "assets/hero sprite.ts"
+    spaced.parent.mkdir(parents=True)
+    spaced.write_text("export const x = 1;\n", encoding="utf-8")
+    status = atomic_commit.inspect_status(temp_git_repo)
+    paths = {f["path"] for f in status["files"]}
+    assert "assets/hero sprite.ts" in paths
+    atomic_commit.main(["--repo", str(temp_git_repo), "stage", "--reset", "--files", "assets/hero sprite.ts"])
+    assert "assets/hero sprite.ts" in atomic_commit.get_staged_files(temp_git_repo)
+
