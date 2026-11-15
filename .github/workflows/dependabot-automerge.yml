@@ -16,15 +16,22 @@ jobs:
       - name: Checkout PR
         uses: actions/checkout@v7
 
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+
       - name: Set up uv
         uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
 
-      - name: Sync dependencies from uv.lock and run full pytest suite
+      - name: Sync dependencies from uv.lock and run full offline pytest suite
         run: |
           uv sync --frozen
-          uv run pytest -v
+          uv run pytest -m "not llm_eval" -v
 
-      - name: Approve and auto-merge Dependabot PR
+      - name: Approve and auto-merge Dependabot PR (minor and patch only)
+        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
