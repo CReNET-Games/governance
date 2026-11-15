@@ -2,160 +2,115 @@
 
 [![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FCReNET-Games%2Fgovernance.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2FCReNET-Games%2Fgovernance?ref=badge_shield)
 
-This repository serves as a generalized, open-source governance framework designed for indie game developers working with AI Agents. It provides central legal compliance, IP protection, and an automated AI asset disclosure pipeline. It is built to be included as a Git submodule (e.g., under `governance/`) across multiple game repositories to enforce standardized rules for both human developers and autonomous AI Agents.
+This repository is the canonical studio governance submodule for Crenet Games repositories. It centralizes engineering rules, agent workflow skills, asset provenance tooling, and a shared global MCP server for Antigravity, Cursor, and Claude Code.
 
 ---
 
-## Why this Architecture?
+## Architecture Overview
 
-This boilerplate is designed to solve complex multi-agent orchestration and legal compliance challenges at scale. For engineering reviewers and recruiters, here is the architectural rationale:
-
-1. **FastMCP (Model Context Protocol)**: By wrapping governance logic in a FastMCP server, we decouple compliance checks and ledgering from the core game engine. This creates a standardized, language-agnostic interface that any AI agent (using the Gemini API, Claude, etc.) can query to understand local environment rules and record its actions.
-2. **JSON Ledgers for Authorship**: The Steam storefront requires strict disclosure for AI-generated assets. Instead of messy database dependencies, this architecture uses isolated JSON ledgers (`assets_ledger.json`) written directly to the active workspace. This provides a lightweight, immutable, and highly auditable paper trail for copyright defense and hybrid human-AI authorship tracking.
-3. **Git Submodule Injection (DRY)**: To maintain a single source of truth for agent behavior (e.g., code standards, accessibility rules, VPN checks), this repository acts as a submodule. The included `setup.sh` installer dynamically symlinks specific rules, skills, and hooks into the parent repository. This ensures all active game projects instantly inherit updated governance rules without code duplication.
-4. **Enforced Agent Hooks**: The repository utilizes Antigravity (`hooks.json`) and Claude Code (`.claude/hooks/`) lifecycle hooks to strictly enforce governance policies (e.g., blocking an agent from exiting if it hasn't logged an AI-generated image).
-5. **Automated License Compliance (FOSSA)**: All dependencies and packages are automatically scanned by FOSSA in CI/CD pipelines to proactively detect open-source license violations and known security vulnerabilities.
+1. **Global FastMCP Governance Server (`mcp-server/server.py`, `scripts/run-mcp.sh`)**: Installed once into `~/.local/share/crenet-governance` via `--global` and registered across Antigravity (`~/.gemini/config/mcp_config.json`), Cursor (`~/.cursor/mcp.json`), and Claude Code (`~/.claude.json`). Exposes stateless, workspace-isolated tools for step-by-step asset provenance (`log_asset_provenance`, `move_asset_provenance`, `audit_asset_provenance`) and dependency-aware atomic commits (`atomic_commit_status`, `atomic_commit_hunks`, `atomic_commit_stage`, `atomic_commit_verify`).
+2. **Recipe-Based Asset Provenance Ledger (`scripts/ledger.py`, `schemas/asset_ledger_schema.json`)**: Tracks every game asset and `artifacts/` intermediate using bounded `1..6` ordered `steps` (`human`, `ai`, or `procedural`), computing `ai_involvement` (`none` | `assisted` | `generated`), auto-hashing SHA-256 digests, tracking asset graduations (`previous_paths`), and generating Publisher / M&A Audit Scorecards (`ledger.py report`).
+3. **Zero-Overhead Agent Hooks (`scripts/check_assets.py`)**: Uses tool-filtered `PostToolUse` checks (skipping benign read/test shell commands in `<1ms`) to capture intermediate subagent/MCP/CLI prompts into `PostInvocation` hints plus loop-guarded `Stop` safety checks for Antigravity, Cursor, and Claude Code.
+4. **Non-Destructive Setup (`setup.sh`)**: Separates one-time global MCP server installation (`--global`) from per-repository submodule wiring (`.agents/`, `.claude/`, `.aiignore` symlinks, and fenced `.gitignore` / `AGENTS.md` sections) without overwriting project customizations. Opt a non-game repo out of asset tracking with `--no-asset-provenance` (`.crenet-governance.json`).
 
 ---
 
-## Submodule Integration & Auto-Discovery
+## Setup & Integration
 
-When cloned as a Git submodule under `governance/`, the AI agent framework automatically discovers and merges studio rules. Run `setup.sh` after adding or updating the submodule in your game repository:
+### 1. One-Time Global MCP Server Install (`$HOME`)
+
+Install a single shared `crenet-governance` MCP server to `~/.local/share/crenet-governance` and merge it safely into Antigravity, Cursor, and Claude Code user configs:
+
+```bash
+./setup.sh --global          # or ./governance/setup.sh --global
+./setup.sh --global --clean  # remove global install and unregister MCP entries
+```
+
+### 2. Per-Repository Submodule Setup
+
+Run `setup.sh` after adding or updating the `governance` submodule inside a game or service repository:
 
 ```bash
 # Inside parent project root:
 git submodule add <repo-url> governance
 ./governance/setup.sh
 
-# To clean or remove governance symlinks, .gitignore entries, and AGENTS.md references:
+# Disable asset provenance enforcement for non-game web/docs repositories:
+./governance/setup.sh --no-asset-provenance
+
+# Remove governance symlinks and fenced entries:
 ./governance/setup.sh --clean
 ```
-
-### Symlink Lifecycle & `.gitignore` Management (`setup.sh`):
-
-1. **Granular Merging**: Creates physical `.agents/` and `.claude/` folders in the parent repository, symlinking rules, skills, and hooks into place.
-2. **Automated `.gitignore` Synchronization**: Automatically adds symlinked governance paths to the parent's `.gitignore`. Running `setup.sh` dynamically prunes removed entries.
-3. **Automated Teardown & Orphan Cleanup**: Removes broken symlinks and cleans up governance entries upon teardown.
-4. **Parent `AGENTS.md` Integration**: Appends a studio governance index reference to the parent project's `AGENTS.md`.
 
 ---
 
 ## Directory Structure
 
-```
+```text
 governance/
-├── .agents/                               # Canonical Agent Customization Directory
-│   ├── AGENTS.md                          # Primary agent governance rule index
-│   ├── hooks.json                         # Antigravity hooks wired to central scripts
-│   ├── rules/                             # Always-on domain & coding rules
-│   │   ├── agent-execution-speed.md       # Parallel reads, git grep search, inner-loop test scopes
-│   │   ├── code-standards.md              # HTML, CSS, TypeScript POJO enums, Makefile, Vite & Vitest rules
-│   │   └── environment-isolation.md       # Strict environment isolation constraint check
-│   └── skills/                            # On-demand procedural skill runbooks
-│       └── atomic-commit-chain/           # Stacked atomic commit & review gate workflow
-│           ├── SKILL.md                   # Cross-agent workflow instructions
-│           └── scripts/atomic_commit.py   # Symlink to ../../scripts/atomic_commit.py
-├── .claude/
-│   ├── hooks/                             # Claude Code hooks wired to central scripts
-│   │   └── check_assets.sh                # Wrapper script for asset ledger enforcement
+├── .agents/
+│   ├── AGENTS.md                                  # Studio governance rule & skill index
+│   ├── hooks.json                                 # Agent-agnostic PostToolUse/PostInvocation/Stop hooks
+│   ├── rules/
+│   │   ├── agent-execution-speed.md               # Parallel reads, git grep, fast inner-loop verification
+│   │   └── code-standards.md                      # HTML, CSS, TS POJO enums, Makefile, Vite/Vitest rules
 │   └── skills/
-│       └── atomic-commit-chain            # Symlink to ../../.agents/skills/atomic-commit-chain
-├── scripts/
-│   ├── atomic_commit.py                   # Deterministic CLI for atomic commit chains (status, hunks, stage, verify)
-│   └── check_assets.py                    # Core python logic for asset ledger enforcement
+│       └── atomic-commit-chain/                   # Stacked atomic commit & human review gate workflow
+├── .claude/
+│   ├── settings.json                              # Claude Code PostToolUse & Stop hooks
+│   ├── hooks/check_assets.sh                      # POSIX hook wrapper delegating to check_assets.py
+│   └── skills/atomic-commit-chain                 # Symlink to ../../.agents/skills/atomic-commit-chain
 ├── mcp-server/
-│   └── server.py                          # Central FastMCP Server
+│   └── server.py                                  # CrenetGovernance FastMCP server
 ├── schemas/
-│   └── asset_ledger_schema.json           # JSON Schema for asset ledger entries
+│   └── asset_ledger_schema.json                   # Draft-07 JSON Schema for v2 asset ledgers
+├── scripts/
+│   ├── atomic_commit.py                           # CLI & library for status/hunks/stage/verify
+│   ├── check_assets.py                            # Hook runner for Antigravity, Cursor, and Claude Code
+│   ├── ledger.py                                  # Asset ledger CLI (log, move, sync-moves, verify, report, migrate)
+│   └── run-mcp.sh                                 # Portable MCP server launcher (PATH + .venv -> uv -> python3)
 ├── tests/
-│   ├── test_atomic_commit.py              # Pytest suite for atomic commit CLI & isolated worktree verification
-│   ├── test_check_assets.py               # Pytest suite for asset ledger hooks
-│   ├── test_server.py                     # Pytest suite for MCP compliance tools
-│   └── test_setup_script.py               # Pytest suite for setup.sh installer lifecycle
-├── setup.sh                               # Submodule lifecycle installer
-├── .env                                   # Governance environment configuration
-├── fastmcp.json                           # FastMCP server configuration & tool metadata
-├── pyproject.toml                         # Python project configuration & dependencies
-└── README.md                              # Repository documentation & usage guide
+│   ├── test_atomic_commit.py                      # Tests for static graph, tsconfig aliases, worktree verify
+│   ├── test_check_assets.py                       # Tests for tool-filtered hooks and loop protection
+│   ├── test_evals_llm.py                          # Rubric/catalog tests and live LLM behavioral evals
+│   ├── test_ledger.py                             # Tests for v2 schema, migration, graduation, scorecards
+│   ├── test_server.py                             # Tests for CrenetGovernance FastMCP tools
+│   ├── test_setup_script.py                       # Tests for non-destructive setup.sh local & --global lifecycle
+│   └── test_skill_and_rule_lint.py                # Frontmatter, parity, executable mode, and link lint
+├── fastmcp.json                                   # FastMCP server metadata
+├── Makefile                                       # Offline test & eval orchestration
+├── pyproject.toml                                 # Python dependencies & pytest configuration
+└── setup.sh                                       # Non-destructive per-repo & --global setup script
 ```
 
 ---
 
-## `uv` Setup Commands
-
-Install dependencies, run unit tests, and launch the FastMCP server using `uv`:
+## Asset Provenance CLI (`scripts/ledger.py`)
 
 ```bash
-# 1. Initialize project with uv (if setting up anew)
-uv init --no-readme
+# Log a single-step human or procedural asset:
+python3 governance/scripts/ledger.py log client/public/logo.svg --actor procedural --tool Inkscape --summary "Vector logo export."
 
-# 2. Install required dependencies
-uv add fastmcp pydantic-settings
-uv add --dev pytest
+# Graduate an approved artifact from artifacts/ into client/public/, preserving AI prompts:
+python3 governance/scripts/ledger.py move artifacts/storefront/hero_raw.png client/public/hero.png \
+  --actor human --tool GIMP --summary "Color graded and cropped to 1200x630."
 
-# 3. Sync virtual environment
-uv sync
-
-# 4. Run the full unit test suite (MCP tools + setup.sh installer lifecycle)
-uv run pytest -v
-
-# 5. Run the MCP server natively
-uv run mcp-server/server.py
+# Verify disk assets against docs/assets_ledger.json and print a Publisher/M&A scorecard:
+python3 governance/scripts/ledger.py verify
+python3 governance/scripts/ledger.py report
 ```
 
 ---
 
-## FastMCP Configuration (`fastmcp.json`)
-
-The server configuration and tool metadata are declared in `fastmcp.json`:
-
-```json
-{
-  "name": "GovernanceMCP",
-  "version": "0.1.0",
-  "description": "Centralized governance, compliance, and legal audit layer for game repositories.",
-  "server": {
-    "entrypoint": "mcp-server/server.py:mcp",
-    "transport": "stdio"
-  },
-  "environment": {
-    "ASSETS_LEDGER_PATH": "./docs/assets_ledger.json",
-    "ALLOWED_EMAIL_DOMAINS": "@crenet.games",
-    "RESTRICTED_NETWORK_PROFILES": "cisco,anyconnect,globalprotect,zscaler,pulse,forticlient"
-  }
-}
-```
-
----
-
-## MCP Server Tools (`mcp-server/server.py`)
-
-The Model Context Protocol (MCP) server provides compliance tools to AI agents operating across local game repositories.
-
-### 1. `log_ai_asset`
-- **Purpose**: Maintains a strict legal paper trail for Steam AI disclosures, copyright defense, img2img pipelines, and human post-edit authorship tracking.
-- **Dynamic Path Logic**: Writes directly to `./docs/assets_ledger.json` in the active workspace, keeping individual repository ledgers isolated.
-
-### 2. `verify_environment_isolation`
-- **Purpose**: Prevents IP contamination by verifying that the agent and environment comply with strict environment isolation rules.
-- **Validation Logic**:
-  - **Git Config Email**: Checks `git config user.email` in the local workspace. Allowed domains are configured via the `ALLOWED_EMAIL_DOMAINS` environment variable.
-  - **Process / Network Detection**: Scans active processes (`ps aux`) for restricted network profiles configured via `RESTRICTED_NETWORK_PROFILES`.
-  - **Action**: Raises a `RuntimeError` if unauthorized email domains or active restricted network profiles are detected, blocking unapproved commits or cloud deployments.
-
-### 3. Atomic Commit Chain Tools (`atomic_commit_status`, `atomic_commit_hunks`, `atomic_commit_stage`, `atomic_commit_verify`)
-- **Purpose**: Powers the `atomic-commit-chain` skill by decomposing dirty working trees after high-velocity exploration into topologically ordered, `git bisect`-safe commits with a human review gate.
-- **Single Source of Truth**: Delegates directly to `scripts/atomic_commit.py` to compute static import graphs (`status`), inspect numbered diff hunks (`hunks`), stage partial file hunks non-interactively (`stage`), and verify staged slices against unstaged dependencies in an isolated ephemeral `git write-tree` worktree (`verify`).
-
----
-
-## Unit Testing
-
-Run unit tests covering `log_ai_asset` workspace isolation, hybrid pipeline metadata, compliant/non-compliant git email validation, unauthorized network process detection, and `setup.sh` installer lifecycle:
+## Testing & Verification
 
 ```bash
-uv run pytest -v
+uv sync --frozen
+make test          # Fast offline suite (-m "not llm_eval")
+make lint-skills   # Skill/rule frontmatter, token budgets, and Markdown link lint
+make test-evals    # Live LLM behavioral evaluations (requires provider API key)
 ```
 
 ## License
+
 [![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FCReNET-Games%2Fgovernance.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2FCReNET-Games%2Fgovernance?ref=badge_large)

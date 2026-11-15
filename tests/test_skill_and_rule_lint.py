@@ -182,6 +182,13 @@ def test_markdown_links_and_antigravity_includes_resolve(doc_path: Path):
 
         candidate_from_doc = (doc_path.parent / clean_target).resolve()
         candidate_from_root = (REPO_ROOT / clean_target).resolve()
-        assert candidate_from_doc.exists() or candidate_from_root.exists(), (
-            f"Broken relative link {target!r} in {doc_path.relative_to(REPO_ROOT)}"
-        )
+        is_at_include = match.group(0).startswith("@")
+        if is_at_include:
+            assert candidate_from_root.exists(), (
+                f"Broken @include link {target!r} in {doc_path.relative_to(REPO_ROOT)}"
+            )
+        else:
+            assert candidate_from_doc.exists(), (
+                f"Broken relative link {target!r} in {doc_path.relative_to(REPO_ROOT)} "
+                "(must resolve relative to the document's parent directory)"
+            )
