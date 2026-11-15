@@ -21,4 +21,5 @@ Follow these execution rules on every turn to prevent serial tool-call round-tri
 
 ## 3. Inner-Loop Build & Test Verification
 - **During Iteration:** Run targeted single-file Vitest suites (`npx vitest run server/tests/<file>.test.ts` or `npx vitest run client/tests/<file>.test.ts`) and fast typechecking (`make typecheck`) instead of rebuilding presskit zips or running all suites after every edit.
+- **Unit vs. Stress Suites:** Keep default `npm test` scoped to fast unit projects (`--project client --project server-unit`); run single-worker stress/tick-budget suites (`npm run test:stress`) only when modifying simulation loops, networking, or frame-budget code, or at the final gate.
 - **Final Gate:** Run `make build && make test` once at the end of the task when all edits are complete.

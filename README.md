@@ -48,7 +48,8 @@ governance/
 │   ├── AGENTS.md                          # Primary agent governance rule index
 │   ├── hooks.json                         # Antigravity hooks wired to central scripts
 │   ├── rules/                             # Always-on domain & coding rules
-│   │   ├── code-standards.md              # HTML, CSS, TypeScript POJO enums, Makefile & Jest rules
+│   │   ├── agent-execution-speed.md       # Parallel reads, git grep search, inner-loop test scopes
+│   │   ├── code-standards.md              # HTML, CSS, TypeScript POJO enums, Makefile, Vite & Vitest rules
 │   │   └── environment-isolation.md       # Strict environment isolation constraint check
 │   └── skills/                            # On-demand procedural skill runbooks
 │       └── atomic-commit-chain/           # Stacked atomic commit & review gate workflow
