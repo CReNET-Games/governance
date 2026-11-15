@@ -1,16 +1,23 @@
 {
   "asset-ledger-enforcement": {
     "enabled": true,
+    "PostToolUse": [
+      {
+        "matcher": "invoke_subagent|send_message|run_command|call_mcp_tool|mcp_.*",
+        "type": "command",
+        "command": "python3 -c 'import os,sys;p=next((x for x in (\"governance/scripts/check_assets.py\",\"../governance/scripts/check_assets.py\",\"scripts/check_assets.py\",\"../scripts/check_assets.py\") if os.path.exists(x)),None);os.execv(sys.executable,[sys.executable,p,\"--mode\",\"post_tool_use\"]) if p else print(\"{}\")'"
+      }
+    ],
     "PostInvocation": [
       {
         "type": "command",
-        "command": "python3 ../scripts/check_assets.py --mode post_invocation"
+        "command": "python3 -c 'import os,sys;p=next((x for x in (\"governance/scripts/check_assets.py\",\"../governance/scripts/check_assets.py\",\"scripts/check_assets.py\",\"../scripts/check_assets.py\") if os.path.exists(x)),None);os.execv(sys.executable,[sys.executable,p,\"--mode\",\"post_invocation\"]) if p else print(\"{}\")'"
       }
     ],
     "Stop": [
       {
         "type": "command",
-        "command": "python3 ../scripts/check_assets.py --mode stop"
+        "command": "python3 -c 'import os,sys;p=next((x for x in (\"governance/scripts/check_assets.py\",\"../governance/scripts/check_assets.py\",\"scripts/check_assets.py\",\"../scripts/check_assets.py\") if os.path.exists(x)),None);os.execv(sys.executable,[sys.executable,p,\"--mode\",\"stop\"]) if p else print(\"{\\\"decision\\\":\\\"allow\\\"}\")'"
       }
     ]
   }

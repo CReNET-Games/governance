@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Task|Agent|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'for p in .claude/hooks/check_assets.sh governance/.claude/hooks/check_assets.sh; do [ -f \"$p\" ] && exec bash \"$p\" --mode claude_post_tool_use; done; echo \"{}\"' "
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'for p in .claude/hooks/check_assets.sh governance/.claude/hooks/check_assets.sh; do [ -f \"$p\" ] && exec bash \"$p\" --mode claude_stop; done; echo \"{}\"' "
+          }
+        ]
+      }
+    ]
+  }
+}
