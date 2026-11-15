@@ -51,7 +51,7 @@ Always use the deterministic atomic commit tools rather than ad-hoc `git add -p`
 
 ### Step 2: Present the Commit Chain Roadmap (Wait for Approval)
 
-Before staging Commit 1, output the complete proposed roadmap ($1 \dots N$) to the user:
+Before staging Commit 1, output the complete proposed roadmap ($1 \dots N$) to the user. Every commit entry in the roadmap **MUST explicitly list the exact repository-relative file paths** (and hunk numbers, when partially staged) assigned to that commit—never omit file paths or summarize commits by package/scope name alone, even when using a compact table or under time pressure:
 
 ```markdown
 ### Proposed Atomic Commit Chain (1..N)

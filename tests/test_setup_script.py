@@ -8,6 +8,18 @@ import pytest
 
 GOVERNANCE_REPO_DIR = Path(__file__).resolve().parent.parent
 
+AI_IGNORE_SYMLINKS = (
+    ".geminiignore",
+    ".aiexclude",
+    ".cursorignore",
+    ".claudeignore",
+    ".clineignore",
+    ".rooignore",
+    ".aiderignore",
+    ".codeiumignore",
+    ".rgignore",
+)
+
 
 @pytest.fixture
 def mock_parent_workspace(tmp_path: Path) -> Path:
@@ -24,6 +36,7 @@ def mock_parent_workspace(tmp_path: Path) -> Path:
 
     # Copy essential files/folders preserving symlinks
     shutil.copy(GOVERNANCE_REPO_DIR / "setup.sh", submodule_dir / "setup.sh")
+    shutil.copy(GOVERNANCE_REPO_DIR / ".aiignore", submodule_dir / ".aiignore")
     shutil.copytree(
         GOVERNANCE_REPO_DIR / ".agents",
         submodule_dir / ".agents",
@@ -84,6 +97,15 @@ def test_setup_script_initialization(mock_parent_workspace: Path):
     assert claude_skill_link.is_symlink()
     assert (claude_skill_link / "SKILL.md").exists()
 
+    # 2b. Verify canonical .aiignore and agent ignore symlinks
+    canonical_aiignore = mock_parent_workspace / ".aiignore"
+    assert canonical_aiignore.is_file()
+    for ignore_link_name in AI_IGNORE_SYMLINKS:
+        ignore_link = mock_parent_workspace / ignore_link_name
+        assert ignore_link.is_symlink()
+        assert os.readlink(ignore_link) == ".aiignore"
+        assert ignore_link.resolve() == canonical_aiignore.resolve()
+
     # 3. Verify .gitignore
     gitignore = mock_parent_workspace / ".gitignore"
     assert gitignore.exists()
@@ -91,6 +113,8 @@ def test_setup_script_initialization(mock_parent_workspace: Path):
     assert ".agents/rules/governance" in gi_content
     assert ".agents/skills/mock-skill" in gi_content
     assert ".agents/skills/atomic-commit-chain" in gi_content
+    for ignore_link_name in AI_IGNORE_SYMLINKS:
+        assert ignore_link_name in gi_content
 
     # 4. Verify AGENTS.md includes marker and @[label](path) rule expansions
     agents_md = mock_parent_workspace / "AGENTS.md"
@@ -175,11 +199,18 @@ def test_setup_script_clean_teardown(mock_parent_workspace: Path):
     mock_skill_link = mock_parent_workspace / ".agents" / "skills" / "mock-skill"
     assert not rules_link.exists()
     assert not mock_skill_link.exists()
+    assert (mock_parent_workspace / ".aiignore").is_file()
+    for ignore_link_name in AI_IGNORE_SYMLINKS:
+        ignore_link = mock_parent_workspace / ignore_link_name
+        assert not ignore_link.is_symlink()
+        assert not ignore_link.exists()
 
     # Verify .gitignore entries removed
     gi_content = (mock_parent_workspace / ".gitignore").read_text()
     assert ".agents/rules/governance" not in gi_content
     assert ".agents/skills/mock-skill" not in gi_content
+    for ignore_link_name in AI_IGNORE_SYMLINKS:
+        assert ignore_link_name not in gi_content
 
     # Verify AGENTS.md governance reference removed
     agents_content = (mock_parent_workspace / "AGENTS.md").read_text()

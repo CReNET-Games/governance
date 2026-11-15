@@ -10,9 +10,69 @@ import urllib.request
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-CODE_STANDARDS_PATH = REPO_ROOT / ".agents" / "rules" / "code-standards.md"
-ENVIRONMENT_ISOLATION_PATH = REPO_ROOT / ".agents" / "rules" / "environment-isolation.md"
-ATOMIC_COMMIT_SKILL_PATH = REPO_ROOT / ".agents" / "skills" / "atomic-commit-chain" / "SKILL.md"
+AGENTS_DIR = REPO_ROOT / ".agents"
+RULES_DIR = AGENTS_DIR / "rules"
+SKILLS_DIR = AGENTS_DIR / "skills"
+CODE_STANDARDS_PATH = RULES_DIR / "code-standards.md"
+ENVIRONMENT_ISOLATION_PATH = RULES_DIR / "environment-isolation.md"
+ATOMIC_COMMIT_SKILL_PATH = SKILLS_DIR / "atomic-commit-chain" / "SKILL.md"
+FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.DOTALL)
+
+
+def parse_simple_frontmatter(markdown_text: str) -> dict[str, str] | None:
+    """Parse YAML frontmatter (supporting single-line and folded block scalars) without third-party deps."""
+    match = FRONTMATTER_RE.match(markdown_text)
+    if not match:
+        return None
+
+    raw = match.group(1)
+    result: dict[str, str] = {}
+    current_key: str | None = None
+    buffer: list[str] = []
+
+    for line in raw.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line.startswith((" ", "\t")) and ":" in line:
+            if current_key is not None:
+                result[current_key] = " ".join(buffer).strip()
+            key, val = line.split(":", 1)
+            current_key = key.strip()
+            val = val.strip()
+            if val in (">-", ">", "|", "|-", ""):
+                buffer = []
+            else:
+                buffer = [val.strip("'\"")]
+        elif current_key is not None:
+            buffer.append(line.strip())
+
+    if current_key is not None:
+        result[current_key] = " ".join(buffer).strip()
+
+    return result
+
+
+def discover_governance_docs() -> list[Path]:
+    """Return all skill and rule markdown files in deterministic order."""
+    return [
+        *sorted(SKILLS_DIR.glob("*/SKILL.md")),
+        *sorted(RULES_DIR.glob("*.md")),
+    ]
+
+
+def build_routing_catalog() -> tuple[str, list[str]]:
+    """Build the skill/rule routing catalog and identifier list from frontmatter."""
+    entries: list[str] = []
+    identifiers: list[str] = []
+    for doc_path in discover_governance_docs():
+        fm = parse_simple_frontmatter(doc_path.read_text(encoding="utf-8")) or {}
+        fallback_name = doc_path.parent.name if doc_path.name == "SKILL.md" else doc_path.stem
+        identifier = fm.get("name") or fallback_name
+        description = fm.get("description", "")
+        identifiers.append(identifier)
+        entries.append(f"- `{identifier}`: {description}")
+    catalog = "Available Crenet Governance customizations:\n" + "\n".join(entries) + "\n"
+    return (catalog, identifiers)
 
 # 8 Industry-Standard Agentic Skill & Rule Evaluation Rubrics
 AUTHORING_RUBRICS: dict[str, str] = {
@@ -589,22 +649,35 @@ def test_record_scorecard_section_writes_github_step_summary(tmp_path: Path):
     assert "<summary>View Candidate Model Output</summary>" in content
 
 
+def test_build_routing_catalog_includes_all_skills_and_rules():
+    """Verifies dynamic routing catalog includes all governance skills and rules without truncation."""
+    catalog, identifiers = build_routing_catalog()
+    expected_ids = [
+        "atomic-commit-chain",
+        "agent-execution-speed",
+        "code-standards",
+        "environment-isolation",
+    ]
+    assert identifiers == expected_ids
+    assert "Decomposes a dirty working tree" in catalog
+    assert "as an atomic commit chain or stacked commits." in catalog
+    assert "Vite/Vitest monorepo and testing standards." in catalog
+    assert "git grep / rg" in catalog
+
+
 # ---------------------------------------------------------------------------
 # Live Free-Tier LLM Evaluations (`make test-evals` / `pytest -m llm_eval`)
-# Total API budget: 8 calls per run (1 authoring audit + 3 routing + 2x2 gen+judge)
+# Total API budget: 9 calls per run (1 authoring audit + 4 routing + 2x2 gen+judge)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.llm_eval
 def test_eval_skill_and_rule_authoring_rubrics():
-    """Audits the repo's skill & rule markdown files across all 8 industry rubrics in 1 batched judge call."""
-    combined_docs = (
-        "=== FILE: .agents/skills/atomic-commit-chain/SKILL.md ===\n"
-        + ATOMIC_COMMIT_SKILL_PATH.read_text(encoding="utf-8")
-        + "\n\n=== FILE: .agents/rules/code-standards.md ===\n"
-        + CODE_STANDARDS_PATH.read_text(encoding="utf-8")
-        + "\n\n=== FILE: .agents/rules/environment-isolation.md ===\n"
-        + ENVIRONMENT_ISOLATION_PATH.read_text(encoding="utf-8")
+    """Audits all repo skill & rule markdown files across all 8 industry rubrics in 1 batched judge call."""
+    combined_docs = "\n\n".join(
+        f"=== FILE: {doc_path.relative_to(REPO_ROOT).as_posix()} ===\n"
+        + doc_path.read_text(encoding="utf-8")
+        for doc_path in discover_governance_docs()
     )
 
     failures = judge_with_batched_rubrics(
@@ -640,21 +713,19 @@ def test_eval_skill_and_rule_authoring_rubrics():
             "Refactor this vanilla JS UI card to clone an HTML <template> and use a POJO enum instead of TS enum.",
             "code-standards",
         ),
+        (
+            "Batch read_file calls in 800-line parallel windows and use git grep instead of unscoped grep -rn so we don't scan node_modules or dist.",
+            "agent-execution-speed",
+        ),
     ],
 )
 def test_eval_skill_and_rule_routing(developer_prompt: str, expected_target: str):
     """Evaluates Discoverability in action: whether an LLM routes developer requests to the matching skill/rule."""
-    catalog = (
-        "Available Crenet Governance customizations:\n"
-        "- `atomic-commit-chain`: "
-        + ATOMIC_COMMIT_SKILL_PATH.read_text(encoding="utf-8").splitlines()[3]
-        + "\n"
-        "- `environment-isolation`: Pre-commit strict environment isolation checks & Git config email validation.\n"
-        "- `code-standards`: Guidelines for HTML templates, semantic CSS, TypeScript POJO enums, Makefile orchestration, and Jest/Vitest testing standards.\n"
-    )
+    catalog, identifiers = build_routing_catalog()
+    id_list = ", ".join(f"`{name}`" for name in identifiers)
     system_prompt = (
         f"{catalog}\n"
-        "Reply with ONLY the exact identifier (`atomic-commit-chain`, `environment-isolation`, or `code-standards`) "
+        f"Reply with ONLY the exact identifier ({id_list}) "
         "that best matches the user's request."
     )
 
