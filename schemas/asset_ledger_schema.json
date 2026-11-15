@@ -1,79 +1,131 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "Crenet AI Asset Ledger Schema",
-  "description": "Schema for AI asset tracking, supporting hybrid img2img and human post-edit pipelines.",
-  "type": "array",
-  "items": {
-    "type": "object",
-    "required": [
-      "file_name",
-      "generation_type",
-      "timestamp_utc"
-    ],
-    "properties": {
-      "file_name": {
-        "type": "string",
-        "description": "Path or filename of the final shipped asset in the repository."
-      },
-      "generation_type": {
-        "type": "string",
-        "enum": [
-          "pure_ai",
-          "sketch_to_ai",
-          "ai_to_post_edit",
-          "sketch_to_ai_to_post_edit"
-        ],
-        "description": "The specific pipeline methodology used to create the asset."
-      },
-      "base_human_sketch_ref": {
-        "type": "string",
-        "description": "Reference path to the original human concept art (required for img2img)."
-      },
-      "ai_generation_data": {
-        "type": "object",
-        "description": "Metadata concerning the AI generation phase.",
-        "properties": {
-          "prompt": {
-            "type": "string",
-            "description": "Full prompt text used for AI generation."
-          },
-          "model_used": {
-            "type": "string",
-            "description": "The AI model used (e.g., Stable Diffusion XL, Midjourney v6)."
-          },
-          "seed": {
-            "type": "string",
-            "description": "The generation seed for reproducibility."
-          }
+  "title": "Crenet Games Asset Provenance Ledger",
+  "description": "Tracks provenance recipes (1 to 6 steps) and AI involvement across binary visual/audio game assets and Tier 1 workspace artifacts.",
+  "type": "object",
+  "required": ["version", "assets"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 2
+    },
+    "assets": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/assetEntry"
+      }
+    }
+  },
+  "definitions": {
+    "assetEntry": {
+      "type": "object",
+      "required": ["asset_path", "status", "ai_involvement", "steps", "logged_at"],
+      "additionalProperties": false,
+      "properties": {
+        "asset_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Repository-relative POSIX path to the canonical asset or Tier 1 artifact."
         },
-        "required": [
-          "prompt"
-        ]
-      },
-      "human_post_edit_data": {
-        "type": "object",
-        "description": "Metadata concerning human authorship applied after generation.",
-        "properties": {
-          "source_file_ref": {
+        "previous_paths": {
+          "type": "array",
+          "items": {
             "type": "string",
-            "description": "Path to the layered project file (e.g., .psd, .kra) proving human modification."
+            "minLength": 1
           },
-          "modification_description": {
-            "type": "string",
-            "description": "Brief summary of human edits (e.g., 'repainted cockpit highlights, adjusted silhouette')."
-          }
+          "uniqueItems": true,
+          "description": "Former repository-relative paths prior to graduation from artifacts/ or file moves."
         },
-        "required": [
-          "source_file_ref",
-          "modification_description"
-        ]
-      },
-      "timestamp_utc": {
-        "type": "string",
-        "format": "date-time",
-        "description": "UTC timestamp of the ledger entry creation in ISO 8601 format."
+        "status": {
+          "type": "string",
+          "enum": ["active", "deprecated"]
+        },
+        "ai_involvement": {
+          "type": "string",
+          "enum": ["none", "assisted", "generated"],
+          "description": "Derived from steps: 'none' (no ai steps), 'generated' (all ai steps), 'assisted' (mixed)."
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "Lowercase hex SHA-256 digest of the asset file when last logged or verified on disk."
+        },
+        "notes": {
+          "type": "string",
+          "description": "Optional studio context, licensing notes, or audit annotations."
+        },
+        "logged_at": {
+          "type": "string",
+          "minLength": 1,
+          "description": "ISO-8601 UTC timestamp when this asset entry was first created."
+        },
+        "updated_at": {
+          "type": "string",
+          "minLength": 1,
+          "description": "ISO-8601 UTC timestamp when this asset entry was last updated or moved."
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 6,
+          "items": {
+            "$ref": "#/definitions/provenanceStep"
+          }
+        }
       }
     },
-    "additionalProperties": false
+    "provenanceStep": {
+      "type": "object",
+      "required": ["actor", "tool", "summary"],
+      "additionalProperties": false,
+      "properties": {
+        "actor": {
+          "type": "string",
+          "enum": ["human", "ai", "procedural"]
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "prompt": {
+          "type": "string",
+          "minLength": 1
+        },
+        "artifact_ref": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "seed": {
+          "type": ["string", "integer"]
+        },
+        "license": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "if": {
+        "properties": {
+          "actor": { "const": "ai" }
+        },
+        "required": ["actor"]
+      },
+      "then": {
+        "required": ["prompt"]
+      },
+      "else": {
+        "not": {
+          "required": ["prompt"]
+        }
+      }
+    }
   }
 }
