@@ -147,29 +147,49 @@ def audit_asset_provenance(
 
 
 @mcp.tool()
-def atomic_commit_status(workspace_dir: str = ".") -> dict:
-    """Inspects dirty/untracked files, hunk counts, static import graph, and topological commit waves.
+def atomic_commit_status(
+    workspace_dir: str = ".",
+    count_tests: Optional[bool] = None,
+    count_comments: Optional[bool] = None,
+    max_commit_lines: Optional[int] = None,
+    max_pr_lines: Optional[int] = None,
+) -> dict:
+    """Inspects dirty/untracked files, hunk counts, line budgets, static import graph, and topological commit waves.
 
     Read-only tool that analyzes the target Git repository to help partition uncommitted
-    changes into a dependency-ordered atomic commit chain.
+    changes into a dependency-ordered atomic commit chain sized for focused review.
+    Omitted sizing options inherit `.crenet-governance.json` `"sizing"` settings when present.
 
     Args:
         workspace_dir: Path to the target Git repository or workspace directory.
+        count_tests: Override whether test files count in `effective_lines` budgets (default: config or False).
+        count_comments: Override whether comment/docstring lines count in `effective_lines` budgets (default: config or False).
+        max_commit_lines: Soft target for effective lines per commit (default: config or 200).
+        max_pr_lines: Soft target for effective lines per single PR (default: config or 400).
 
     Returns:
         Dictionary containing `repo_root`, `total_dirty_files`, `files`, `topological_waves`,
-        and `mutual_dependency_cycles`.
+        `mutual_dependency_cycles`, `size_summary`, and `coverage_onboarding`.
     """
     repo = atomic_commit.get_repo_root(Path(workspace_dir).resolve())
-    return atomic_commit.inspect_status(repo)
+    return atomic_commit.inspect_status(
+        repo,
+        count_tests=count_tests,
+        count_comments=count_comments,
+        max_commit_lines=max_commit_lines,
+        max_pr_lines=max_pr_lines,
+    )
 
 
 @mcp.tool()
 def atomic_commit_hunks(workspace_dir: str, file: str, cached: bool = False) -> dict:
-    """Lists numbered diff hunks for a file to prepare non-interactive partial staging.
+    """Lists numbered diff hunks (plus symbol chunks for untracked or large hunks) for partial staging.
 
-    Read-only tool that parses `git diff` into 1-based numbered hunks with line ranges
-    and previews so specific hunks can be staged via `atomic_commit_stage`.
+    Read-only tool that parses `git diff` into 1-based numbered hunks with line ranges,
+    categorized line counts (`logic_lines`, `test_lines`, `comment_lines`), and previews
+    so specific hunks or `--lines` ranges can be staged via `atomic_commit_stage`.
+    For untracked files (`hunk_count == 0`) or hunks exceeding `max_commit_lines`, also
+    includes `symbol_chunks` and `suggested_line_slices`.
 
     Args:
         workspace_dir: Path to the target Git repository or workspace directory.
@@ -177,27 +197,27 @@ def atomic_commit_hunks(workspace_dir: str, file: str, cached: bool = False) -> 
         cached: If True, inspect already-staged hunks in the index instead of unstaged working-tree hunks.
 
     Returns:
-        Dictionary containing `file`, `hunk_count`, and `hunks` metadata.
+        Dictionary containing `file`, `hunk_count`, `hunks`, and optionally `symbol_chunks`
+        and `suggested_line_slices`.
     """
     repo = atomic_commit.get_repo_root(Path(workspace_dir).resolve())
-    fdiff = atomic_commit.parse_single_file_diff(repo, file, cached=cached)
-    return {
+    cfg = atomic_commit.load_sizing_config(repo)
+    fdiff, hunk_dicts = atomic_commit.get_file_hunks_with_stats(
+        repo, file, cached=cached, sizing_config=cfg
+    )
+    result: dict = {
         "file": fdiff.file_path,
         "hunk_count": len(fdiff.hunks),
-        "hunks": [
-            {
-                "index": h.index,
-                "header": h.header.strip(),
-                "old_start": h.old_start,
-                "old_count": h.old_count,
-                "new_start": h.new_start,
-                "new_count": h.new_count,
-                "section_hint": h.section_hint,
-                "preview": h.preview,
-            }
-            for h in fdiff.hunks
-        ],
+        "hunks": hunk_dicts,
     }
+    if not cached and (
+        not fdiff.hunks
+        or any(hd["logic_lines"] > cfg.max_commit_lines for hd in hunk_dicts)
+    ):
+        chunk_analysis = atomic_commit.analyze_file_chunks(repo, file, sizing_config=cfg)
+        result["symbol_chunks"] = chunk_analysis["chunks"]
+        result["suggested_line_slices"] = chunk_analysis["suggested_line_slices"]
+    return result
 
 
 @mcp.tool()
@@ -205,14 +225,16 @@ def atomic_commit_stage(
     workspace_dir: str,
     files: Optional[List[str]] = None,
     hunks: Optional[List[str]] = None,
+    lines: Optional[List[str]] = None,
     reset: bool = False,
 ) -> dict:
-    """Non-interactively stages full files and/or specific numbered hunks into the Git index.
+    """Non-interactively stages full files, numbered hunks, and/or 1-based line ranges into the Git index.
 
     Args:
         workspace_dir: Path to the target Git repository or workspace directory.
         files: Optional list of full repository-relative file paths to stage via `git add`.
         hunks: Optional list of partial-file hunk specs in the format `'path/to/file:1,3'`.
+        lines: Optional list of 1-based line-range specs in the format `'path/to/file:1-60,120-180'` (supports untracked files).
         reset: If True, unstages all currently staged changes (`git reset`) before staging this slice.
 
     Returns:
@@ -233,6 +255,11 @@ def atomic_commit_stage(
             file_path, indices = atomic_commit._parse_hunk_spec(spec)
             atomic_commit.stage_file_hunks(repo, file_path, indices)
 
+    if lines:
+        for lspec in lines:
+            file_path, ranges = atomic_commit.parse_line_spec(lspec)
+            atomic_commit.stage_file_lines(repo, file_path, ranges)
+
     staged = atomic_commit.get_staged_files(repo)
     return {"staged_files": sorted(staged.keys())}
 
@@ -242,27 +269,51 @@ def atomic_commit_verify(
     workspace_dir: str = ".",
     commands: Optional[List[str]] = None,
     skip_worktree: bool = False,
+    max_commit_lines: Optional[int] = None,
+    max_commit_files: Optional[int] = None,
+    count_tests: Optional[bool] = None,
+    count_comments: Optional[bool] = None,
+    coverage_cmd: Optional[str] = None,
+    coverage_report: Optional[str] = None,
+    coverage_mode: Optional[str] = None,
 ) -> dict:
     """Deterministically verifies that the staged slice (`HEAD + index`) is self-contained and passes checks.
 
     Performs static index-vs-worktree dependency isolation checks (ensuring staged files do not
     import unstaged/untracked files or symbols from unstaged hunks), checks for conflict markers
-    and unlogged image assets, and executes `commands` inside an isolated ephemeral `git write-tree`
-    worktree without disturbing the developer's working tree.
+    and unlogged image assets, computes commit size metrics with non-blocking sizing warnings,
+    executes `commands` inside an isolated ephemeral `git write-tree` worktree without
+    disturbing the developer's working tree, and evaluates modular coverage ratchets (`vs_head`
+    and `vs_upstream`) or test-pairing fallbacks.
 
     Args:
         workspace_dir: Path to the target Git repository or workspace directory.
         commands: Optional list of shell commands (e.g., typecheck, unit tests) to run in the isolated worktree.
         skip_worktree: If True, only run fast static index-vs-worktree checks without creating a temporary worktree.
+        max_commit_lines: Soft commit size warning threshold in effective lines (default: config or 200).
+        max_commit_files: Soft commit scope warning threshold in production files (default: config or 10).
+        count_tests: Override whether test files count in `effective_lines` size check (default: config or False).
+        count_comments: Override whether comment/docstring lines count in `effective_lines` size check (default: config or False).
+        coverage_cmd: Optional override shell command to generate a coverage report inside the worktree.
+        coverage_report: Optional worktree-relative coverage report path (Istanbul JSON, coverage.json, lcov.info, or coverage.xml).
+        coverage_mode: Optional override enforcement mode ('warn', 'error', or 'off').
 
     Returns:
-        Dictionary with `passed` (bool), `staged_files`, `errors`, and `command_results`.
+        Dictionary with `passed` (bool), `staged_files`, `errors`, `warnings`, `size_metrics`,
+        `coverage`, and `command_results`.
     """
     repo = atomic_commit.get_repo_root(Path(workspace_dir).resolve())
     return atomic_commit.verify_staged_slice(
         repo,
         commands=commands or [],
         skip_worktree=skip_worktree,
+        max_commit_lines=max_commit_lines,
+        max_commit_files=max_commit_files,
+        count_tests=count_tests,
+        count_comments=count_comments,
+        coverage_cmd=coverage_cmd,
+        coverage_reports=[coverage_report] if coverage_report else None,
+        coverage_mode=coverage_mode,
     )
 
 
