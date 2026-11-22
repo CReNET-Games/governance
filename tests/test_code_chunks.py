@@ -145,3 +145,113 @@ def test_extract_py_and_ts_chunks(
     )
     assert [c["symbols"] for c in chunks] == expected_symbols
 
+
+@pytest.mark.parametrize(
+    ("chunks", "file_role", "target_max", "expected"),
+    [
+        pytest.param(
+            [
+                {
+                    "index": 1,
+                    "kind": "header",
+                    "start_line": 1,
+                    "end_line": 3,
+                    "symbols": [],
+                    "status": "added",
+                    "depends_on_symbols": [],
+                    "logic_lines": 3,
+                    "test_lines": 0,
+                },
+                {
+                    "index": 2,
+                    "kind": "function",
+                    "start_line": 4,
+                    "end_line": 8,
+                    "symbols": ["caller"],
+                    "status": "added",
+                    "depends_on_symbols": ["callee"],
+                    "logic_lines": 5,
+                    "test_lines": 0,
+                },
+                {
+                    "index": 3,
+                    "kind": "function",
+                    "start_line": 9,
+                    "end_line": 10,
+                    "symbols": ["callee"],
+                    "status": "added",
+                    "depends_on_symbols": [],
+                    "logic_lines": 2,
+                    "test_lines": 0,
+                },
+            ],
+            "production",
+            6,
+            [
+                {"slice_index": 1, "chunk_indices": [1, 3], "logic_lines": 5, "line_spec": "m.py:1-3,9-10"},
+                {"slice_index": 2, "chunk_indices": [2], "logic_lines": 5, "line_spec": "m.py:4-8"},
+            ],
+            id="header_and_reverse_dep",
+        ),
+        pytest.param(
+            [
+                {
+                    "index": 1,
+                    "kind": "function",
+                    "start_line": 1,
+                    "end_line": 2,
+                    "symbols": ["ping"],
+                    "status": "added",
+                    "depends_on_symbols": ["pong"],
+                    "logic_lines": 2,
+                    "test_lines": 0,
+                },
+                {
+                    "index": 2,
+                    "kind": "function",
+                    "start_line": 3,
+                    "end_line": 4,
+                    "symbols": ["pong"],
+                    "status": "added",
+                    "depends_on_symbols": ["ping"],
+                    "logic_lines": 2,
+                    "test_lines": 0,
+                },
+            ],
+            "production",
+            10,
+            [{"slice_index": 1, "chunk_indices": [1, 2], "logic_lines": 4, "line_spec": "m.py:1-4"}],
+            id="mutual_cycle_collapsed",
+        ),
+        pytest.param(
+            [
+                {
+                    "index": 1,
+                    "kind": "function",
+                    "start_line": 1,
+                    "end_line": 2,
+                    "symbols": ["ok"],
+                    "status": "unchanged",
+                    "depends_on_symbols": [],
+                    "logic_lines": 2,
+                    "test_lines": 0,
+                }
+            ],
+            "production",
+            10,
+            [],
+            id="unchanged_only",
+        ),
+    ],
+)
+def test_compute_suggested_line_slices_topological_and_cycles(
+    chunks: list[dict], file_role: str, target_max: int, expected: list[dict]
+):
+    """Verifies topological unit packing, header placement, cycle collapsing, and no-dirty empty output."""
+    assert (
+        code_chunks._compute_suggested_line_slices(
+            "m.py", chunks, file_role=file_role, target_max=target_max
+        )
+        == expected
+    )
+

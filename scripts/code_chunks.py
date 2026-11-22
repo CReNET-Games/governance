@@ -374,3 +374,130 @@ def _extract_ts_chunks(wt_lines: list[str]) -> list[dict[str, Any]]:
         raw_chunks[-1]["end_line"] = total_lines
 
     return raw_chunks
+
+
+def _chunk_budget_count(chunk: dict[str, Any], file_role: str) -> int:
+    if file_role == "test":
+        return int(chunk["test_lines"])
+    return int(chunk["logic_lines"])
+
+
+def _merge_line_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not ranges:
+        return []
+    ordered = sorted(ranges)
+    merged: list[tuple[int, int]] = [ordered[0]]
+    for s, e in ordered[1:]:
+        ps, pe = merged[-1]
+        if s <= pe + 1:
+            merged[-1] = (ps, max(pe, e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _format_line_spec(rel_path: str, ranges: list[tuple[int, int]]) -> str:
+    merged = _merge_line_ranges(ranges)
+    parts = [f"{s}-{e}" if s != e else str(s) for s, e in merged]
+    return f"{rel_path}:{','.join(parts)}"
+
+
+def _topological_dirty_units(
+    chunks: list[dict[str, Any]], dirty_indices: list[int]
+) -> list[list[int]]:
+    """Order dirty chunk indices topologically, collapsing mutual dependency cycles."""
+    by_idx = {c["index"]: c for c in chunks}
+    sym_owner: dict[str, int] = {}
+    for idx in dirty_indices:
+        for sym in by_idx[idx]["symbols"]:
+            sym_owner.setdefault(sym, idx)
+
+    header_idx = next(
+        (idx for idx in dirty_indices if by_idx[idx]["kind"] == "header"),
+        None,
+    )
+
+    deps: dict[int, set[int]] = {}
+    for idx in dirty_indices:
+        c_deps = {
+            sym_owner[sym]
+            for sym in by_idx[idx]["depends_on_symbols"]
+            if sym in sym_owner and sym_owner[sym] != idx
+        }
+        if header_idx is not None and idx != header_idx:
+            c_deps.add(header_idx)
+        deps[idx] = c_deps
+
+    units: list[list[int]] = []
+    rem = set(dirty_indices)
+    while rem:
+        ready = sorted(idx for idx in rem if not (deps[idx] & rem))
+        if ready:
+            for item in ready:
+                units.append([item])
+                rem.remove(item)
+        else:
+            units.append(sorted(rem))
+            break
+    return units
+
+
+def _pack_units_into_slices(
+    units: list[list[int]],
+    by_idx: dict[int, dict[str, Any]],
+    *,
+    file_role: str,
+    target_max: int,
+) -> list[list[int]]:
+    """Greedy bin-packer grouping dependency units into `<= target_max`-line slices."""
+    slices: list[list[int]] = []
+    cur_slice: list[int] = []
+    cur_count = 0
+
+    for unit in units:
+        unit_count = sum(_chunk_budget_count(by_idx[i], file_role) for i in unit)
+        if cur_slice and target_max > 0 and cur_count + unit_count > target_max:
+            slices.append(cur_slice)
+            cur_slice = []
+            cur_count = 0
+        cur_slice.extend(unit)
+        cur_count += unit_count
+        if target_max > 0 and unit_count >= target_max:
+            slices.append(cur_slice)
+            cur_slice = []
+            cur_count = 0
+
+    if cur_slice:
+        slices.append(cur_slice)
+    return slices
+
+
+def _compute_suggested_line_slices(
+    rel_path: str,
+    chunks: list[dict[str, Any]],
+    *,
+    file_role: str,
+    target_max: int,
+) -> list[dict[str, Any]]:
+    """Topologically pack dirty symbol chunks into <= `target_max` line-range slices."""
+    dirty_indices = [c["index"] for c in chunks if c["status"] in ("added", "modified")]
+    if not dirty_indices:
+        return []
+
+    by_idx = {c["index"]: c for c in chunks}
+    units = _topological_dirty_units(chunks, dirty_indices)
+    slices = _pack_units_into_slices(units, by_idx, file_role=file_role, target_max=target_max)
+
+    budget_key = "test_lines" if file_role == "test" else "logic_lines"
+    return [
+        {
+            "slice_index": slice_num,
+            "chunk_indices": sorted(idxs),
+            budget_key: sum(by_idx[i][budget_key] for i in idxs),
+            "line_spec": _format_line_spec(
+                rel_path, [(by_idx[i]["start_line"], by_idx[i]["end_line"]) for i in idxs]
+            ),
+        }
+        for slice_num, idxs in enumerate(slices, start=1)
+    ]
+
