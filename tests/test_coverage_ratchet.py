@@ -331,3 +331,57 @@ def test_append_cov_issue(mode: str, exp_errors: list[str], exp_warnings: list[s
     coverage_ratchet._append_cov_issue("m", mode, errors, warnings)
     assert errors == exp_errors
     assert warnings == exp_warnings
+
+
+def test_collect_staged_worktree_coverage_and_evaluate_baseline_ratchet(git_repo: Path, tmp_path: Path):
+    """Verifies staged coverage collection (cache hit/miss/failure) and baseline ratchet evaluation."""
+    cache = coverage_ratchet.CoverageCache(git_repo, cache_path_override=tmp_path / "cov-cache.json")
+    cfg = coverage_ratchet.CoverageConfig(
+        state="configured",
+        command=f"{sys.executable} -c \"import pathlib; pathlib.Path('cov.json').write_text('{{\\\"total\\\": {{\\\"lines\\\": {{\\\"total\\\": 10, \\\"covered\\\": 8}}}}, \\\"src/a.py\\\": {{\\\"lines\\\": {{\\\"total\\\": 10, \\\"covered\\\": 8}}}}}}')\"",
+        report_paths=["cov.json"],
+        mode="warn",
+        fingerprint="fp_r",
+    )
+    cmd_results: list[dict] = []
+    snap, status, errs, warns = coverage_ratchet._collect_staged_worktree_coverage(
+        tmp_path, dict(os.environ), "tree_1", "commit_1", cfg, cache, [], cmd_results, 30
+    )
+    assert status == "evaluated"
+    assert snap is not None and snap.missed_lines == 2
+    assert errs == [] and warns == []
+
+    # Second call hits cache without re-running command
+    cached_snap, cached_status, _, _ = coverage_ratchet._collect_staged_worktree_coverage(
+        tmp_path, dict(os.environ), "tree_1", "commit_1", cfg, cache, [], cmd_results, 30
+    )
+    assert cached_status == "cached"
+    assert cached_snap is not None and len(cmd_results) == 1
+
+    # Missing report path triggers warning in warn mode
+    missing_cfg = coverage_ratchet.CoverageConfig(state="configured", command=None, report_paths=["absent.json"], mode="warn", fingerprint="fp_m")
+    _, m_status, _, m_warns = coverage_ratchet._collect_staged_worktree_coverage(
+        tmp_path / "empty", dict(os.environ), "tree_missing", "commit_m", missing_cfg, cache, [], [], 30
+    )
+    assert m_status == "report_missing"
+    assert m_warns
+
+    # Seed HEAD & origin/main cache entries so _evaluate_baseline_ratchet evaluates delta cleanly
+    head_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=git_repo, text=True).strip()
+    head_tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=git_repo, text=True).strip()
+    subprocess.run(["git", "update-ref", "refs/remotes/origin/main", head_sha], cwd=git_repo, check=True)
+    base_snap = coverage_ratchet.CoverageSnapshot(
+        total_lines=10,
+        covered_lines=9,
+        missed_lines=1,
+        pct=90.0,
+        files={"src/a.py": coverage_ratchet.FileCoverageStat(10, 9, 1)},
+    )
+    cache.put(head_tree, cfg.fingerprint, base_snap, commit_sha=head_sha, label="HEAD")
+    vs_head, vs_up, reg_status, r_errs, r_warns = coverage_ratchet._evaluate_baseline_ratchet(
+        git_repo, snap, ["src/a.py"], cfg, cache, 30
+    )
+    assert reg_status == "regressed"
+    assert vs_head is not None and vs_head["delta_missed"] == 1
+    assert vs_up is not None and vs_up["anchor_ref"] == "origin/main"
+    assert r_errs == [] and any("src/a.py (+1 missed)" in w for w in r_warns)

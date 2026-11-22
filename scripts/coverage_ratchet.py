@@ -692,3 +692,167 @@ def _append_cov_issue(
     else:
         warnings.append(msg)
 
+
+def _collect_staged_worktree_coverage(
+    tmp_dir: Path,
+    wt_env: dict[str, str],
+    tree_sha: str,
+    commit_sha: str,
+    cov_cfg: CoverageConfig,
+    cov_cache: CoverageCache,
+    commands: list[str],
+    command_results: list[dict[str, Any]],
+    command_timeout: int,
+) -> tuple[CoverageSnapshot | None, str, list[str], list[str]]:
+    """Check cache or run configured coverage command inside `tmp_dir`."""
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    cached_snap = cov_cache.get(tree_sha, cov_cfg.fingerprint, label="staged")
+    if cached_snap is not None:
+        return cached_snap, "cached", errors, warnings
+
+    if cov_cfg.command and cov_cfg.command not in commands:
+        try:
+            cproc = subprocess.run(
+                cov_cfg.command,
+                cwd=str(tmp_dir),
+                env=wt_env,
+                shell=True,
+                text=True,
+                capture_output=True,
+                timeout=command_timeout,
+            )
+            command_results.append(
+                {
+                    "command": cov_cfg.command,
+                    "returncode": cproc.returncode,
+                    "stdout": cproc.stdout,
+                    "stderr": cproc.stderr,
+                }
+            )
+            if cproc.returncode != 0:
+                msg = (
+                    f"Coverage command failed (exit {cproc.returncode}) in isolated staged worktree: "
+                    f"{cov_cfg.command}"
+                )
+                _append_cov_issue(msg, cov_cfg.mode, errors, warnings)
+                return None, "command_failed", errors, warnings
+        except subprocess.TimeoutExpired:
+            msg = (
+                f"Coverage command timed out after {command_timeout}s in isolated staged worktree: "
+                f"{cov_cfg.command}"
+            )
+            _append_cov_issue(msg, cov_cfg.mode, errors, warnings)
+            return None, "command_failed", errors, warnings
+
+    try:
+        staged_snap = collect_worktree_coverage(tmp_dir, cov_cfg.report_paths)
+    except (OSError, ValueError, ET.ParseError) as exc:
+        _append_cov_issue(f"Failed to parse coverage report: {exc}", cov_cfg.mode, errors, warnings)
+        return None, "parse_error", errors, warnings
+
+    if staged_snap is not None:
+        cov_cache.put(
+            tree_sha,
+            cov_cfg.fingerprint,
+            staged_snap,
+            commit_sha=commit_sha,
+            label="staged",
+        )
+        return staged_snap, "evaluated", errors, warnings
+
+    expected_desc = ", ".join(cov_cfg.report_paths or DEFAULT_REPORT_CANDIDATES)
+    _append_cov_issue(
+        f"Coverage report not found after running isolated worktree checks (expected: {expected_desc}).",
+        cov_cfg.mode,
+        errors,
+        warnings,
+    )
+    return None, "report_missing", errors, warnings
+
+
+def _evaluate_baseline_ratchet(
+    repo: Path,
+    staged_snap: CoverageSnapshot,
+    staged_prod_paths: list[str],
+    cov_cfg: CoverageConfig,
+    cov_cache: CoverageCache,
+    command_timeout: int,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None, list[str], list[str]]:
+    """Compare `staged_snap` against cached/captured `HEAD` and pinned upstream merge-base."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    vs_head: dict[str, Any] | None = None
+    vs_upstream: dict[str, Any] | None = None
+    new_status: str | None = None
+
+    head_sha = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+    head_tree_sha = _git(["rev-parse", "HEAD^{tree}"], repo).stdout.strip()
+    anchor = resolve_upstream_anchor(repo)
+    head_is_anchor = anchor is not None and anchor[2] == head_tree_sha
+
+    head_snap = _capture_baseline_coverage_snapshot(
+        repo,
+        head_sha,
+        head_tree_sha,
+        anchor[0] if head_is_anchor and anchor is not None else "HEAD",
+        cov_cfg,
+        cov_cache,
+        pinned=head_is_anchor,
+        timeout=command_timeout,
+    )
+    if head_snap is not None:
+        vs_head = compare_coverage_snapshots(staged_snap, head_snap, staged_prod_paths)
+
+    if anchor is not None:
+        anchor_ref, anchor_sha, anchor_tree_sha = anchor
+        upstream_snap = (
+            head_snap
+            if head_is_anchor
+            else _capture_baseline_coverage_snapshot(
+                repo,
+                anchor_sha,
+                anchor_tree_sha,
+                anchor_ref,
+                cov_cfg,
+                cov_cache,
+                pinned=True,
+                timeout=command_timeout,
+            )
+        )
+        if upstream_snap is not None:
+            vs_upstream = compare_coverage_snapshots(staged_snap, upstream_snap, staged_prod_paths)
+            vs_upstream["anchor_ref"] = anchor_ref
+            vs_upstream["anchor_commit"] = anchor_sha[:12]
+
+    if vs_head is not None and vs_head["regressed"]:
+        new_status = "regressed"
+        file_details = ", ".join(
+            f"{rf['path']} (+{rf['delta_missed']} missed)"
+            for rf in vs_head["regressed_files"][:3]
+        )
+        up_note = ""
+        if vs_upstream is not None:
+            up_note = (
+                f"; vs {vs_upstream['anchor_ref']}: "
+                f"{vs_upstream['delta_missed']:+d} missed ({vs_upstream['current_pct']:.2f}%)"
+            )
+        reg_msg = (
+            f"Coverage regression ({cov_cfg.mode}): uncovered lines increased vs HEAD "
+            f"({vs_head['baseline_missed']} -> {vs_head['current_missed']} missed, "
+            f"{vs_head['delta_missed']:+d}; coverage {vs_head['baseline_pct']:.2f}% -> "
+            f"{vs_head['current_pct']:.2f}%{up_note})."
+            + (f" Regressed staged files: {file_details}." if file_details else "")
+            + " Stage or add matching unit tests with this commit so coverage holds."
+        )
+        _append_cov_issue(reg_msg, cov_cfg.mode, errors, warnings)
+    elif vs_upstream is not None and vs_upstream["regressed"]:
+        warnings.append(
+            f"Branch coverage warning: cumulative uncovered lines remain higher than "
+            f"{vs_upstream['anchor_ref']} ({vs_upstream['baseline_missed']} -> "
+            f"{vs_upstream['current_missed']} missed, {vs_upstream['delta_missed']:+d}; "
+            f"{vs_upstream['baseline_pct']:.2f}% -> {vs_upstream['current_pct']:.2f}%)."
+        )
+
+    return vs_head, vs_upstream, new_status, errors, warnings
