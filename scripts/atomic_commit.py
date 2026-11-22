@@ -1104,6 +1104,131 @@ def _load_effective_ledger_for_verify(repo: Path, staged: dict[str, str]):
     return asset_ledger.load_ledger(repo)
 
 
+def _build_size_metrics_dict(
+    stats: LineStats,
+    *,
+    effective_lines: int,
+    production_files: int,
+    test_files: int,
+    generated_files: int,
+    count_tests: bool,
+    count_comments: bool,
+    max_commit_lines: int,
+    max_commit_files: int,
+) -> dict:
+    return {
+        "effective_lines": effective_lines,
+        "logic_lines": stats.logic_lines,
+        "test_lines": stats.test_lines,
+        "comment_lines": stats.comment_lines,
+        "blank_lines": stats.blank_lines,
+        "generated_lines": stats.generated_lines,
+        "raw_additions": stats.raw_additions,
+        "raw_deletions": stats.raw_deletions,
+        "production_files": production_files,
+        "test_files": test_files,
+        "generated_files": generated_files,
+        "count_tests": count_tests,
+        "count_comments": count_comments,
+        "max_commit_lines": max_commit_lines,
+        "max_commit_files": max_commit_files,
+    }
+
+
+def _compute_staged_slice_metrics(
+    repo: Path,
+    staged: dict[str, str],
+    sizing_cfg: SizingConfig,
+    *,
+    head_exists: bool,
+) -> tuple[dict, list[str], list[str], int, list[str]]:
+    """Compute staged slice size metrics, non-blocking size/scope warnings, and pairing inputs."""
+    total_stats = LineStats()
+    production_files = 0
+    test_files = 0
+    generated_files = 0
+    staged_eff_list: list[tuple[int, str]] = []
+    staged_prod_paths: list[str] = []
+    exec_code_logic_lines = 0
+    exec_code_files: list[str] = []
+
+    for rel_path, _status_code in sorted(staged.items()):
+        role = classify_file_role(rel_path, config=sizing_cfg)
+        if role == "generated":
+            generated_files += 1
+        elif role == "test":
+            test_files += 1
+        else:
+            production_files += 1
+            staged_prod_paths.append(rel_path)
+
+        if (repo / rel_path).is_symlink():
+            fstats = LineStats(file_role=role)
+        elif head_exists:
+            fstats = _compute_file_diff_stats(
+                repo, rel_path, cached=True, sizing_config=sizing_cfg
+            )
+        else:
+            fstats = _stats_from_full_text(
+                rel_path,
+                _read_git_blob_text_safe(repo, f":{rel_path}"),
+                config=sizing_cfg,
+            )
+
+        total_stats.add_other(fstats)
+        eff = fstats.effective_lines(
+            count_tests=sizing_cfg.count_tests, count_comments=sizing_cfg.count_comments
+        )
+        staged_eff_list.append((eff, rel_path))
+
+        if (
+            _status_code != "D"
+            and role == "production"
+            and Path(rel_path).suffix.lower() in EXECUTABLE_CODE_EXTS
+            and fstats.raw_additions > 0
+            and fstats.logic_lines > 0
+        ):
+            exec_code_logic_lines += fstats.logic_lines
+            exec_code_files.append(rel_path)
+
+    total_effective = sum(eff for eff, _ in staged_eff_list)
+    size_metrics = _build_size_metrics_dict(
+        total_stats,
+        effective_lines=total_effective,
+        production_files=production_files,
+        test_files=test_files,
+        generated_files=generated_files,
+        count_tests=sizing_cfg.count_tests,
+        count_comments=sizing_cfg.count_comments,
+        max_commit_lines=sizing_cfg.max_commit_lines,
+        max_commit_files=sizing_cfg.max_commit_files,
+    )
+
+    warnings: list[str] = []
+    if sizing_cfg.max_commit_lines > 0 and total_effective > sizing_cfg.max_commit_lines:
+        top3 = sorted(
+            ((eff, path) for eff, path in staged_eff_list if eff > 0),
+            key=lambda item: (-item[0], item[1]),
+        )[:3]
+        top_contributors = ", ".join(f"{path} ({eff} lines)" for eff, path in top3)
+        warnings.append(
+            f"Commit size warning: staged slice has {total_effective} effective lines "
+            f"(target <= {sizing_cfg.max_commit_lines}; tests={'included' if sizing_cfg.count_tests else 'excluded'}, "
+            f"comments={'included' if sizing_cfg.count_comments else 'excluded'}). "
+            f"Largest contributors: {top_contributors}. "
+            f"Consider splitting functions/hunks bottom-up via `hunks`/`chunks` + `stage --lines` "
+            f"(keep whole only when symbols are mutually coupled)."
+        )
+
+    if sizing_cfg.max_commit_files > 0 and production_files > sizing_cfg.max_commit_files:
+        warnings.append(
+            f"Commit scope warning: staged slice touches {production_files} production files "
+            f"(target <= {sizing_cfg.max_commit_files}; excludes test & generated files). "
+            f"Consider narrowing this commit to a smaller vertical/layer slice if concerns are separable."
+        )
+
+    return size_metrics, warnings, staged_prod_paths, exec_code_logic_lines, exec_code_files
+
 def verify_staged_slice(
     repo: Path,
     commands: list[str] | None = None,

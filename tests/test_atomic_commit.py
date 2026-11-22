@@ -580,3 +580,36 @@ def test_line_counting_skips_comments_tests_blanks_and_generated_by_default(
     assert by_path["uv.lock"]["file_role"] == "generated"
     assert by_path["uv.lock"]["effective_lines"] == 0
 
+
+@pytest.mark.parametrize(
+    ("max_lines", "max_files", "expected_warn_substr"),
+    [
+        pytest.param(10, 10, None, id="within_budget"),
+        pytest.param(1, 10, "Commit size warning", id="exceeds_line_budget"),
+        pytest.param(10, 0, None, id="unlimited_files_when_zero"),
+    ],
+)
+def test_compute_staged_slice_metrics(
+    temp_git_repo: Path,
+    max_lines: int,
+    max_files: int,
+    expected_warn_substr: str | None,
+):
+    """Verifies _compute_staged_slice_metrics totals, pairing metadata, and size warnings."""
+    (temp_git_repo / "app.py").write_text("a = 1\nb = 2\n", encoding="utf-8")
+    (temp_git_repo / "tests").mkdir(exist_ok=True)
+    (temp_git_repo / "tests/test_app.py").write_text("def test_a(): assert True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.py", "tests/test_app.py"], cwd=temp_git_repo, check=True)
+    staged = atomic_commit.get_staged_files(temp_git_repo)
+    cfg = atomic_commit.SizingConfig(max_commit_lines=max_lines, max_commit_files=max_files)
+    metrics, warns, prod_paths, exec_lines, exec_files = atomic_commit._compute_staged_slice_metrics(
+        temp_git_repo, staged, cfg, head_exists=True
+    )
+    assert metrics["effective_lines"] == 2
+    assert prod_paths == ["app.py"]
+    assert exec_lines == 2 and exec_files == ["app.py"]
+    if expected_warn_substr is None:
+        assert warns == []
+    else:
+        assert any(expected_warn_substr in w for w in warns)
+
