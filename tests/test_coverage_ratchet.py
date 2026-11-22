@@ -287,3 +287,47 @@ def test_compare_coverage_snapshots(
     assert diff["regressed"] is expected_regressed
     assert diff["delta_missed"] == expected_delta_missed
     assert [f["path"] for f in diff["regressed_files"]] == expected_files
+
+
+def test_build_worktree_env_and_ephemeral_worktree(git_repo: Path):
+    """Verifies _build_worktree_env prepends venv/node bins and _ephemeral_worktree cleans up."""
+    (git_repo / ".venv" / "bin").mkdir(parents=True)
+    (git_repo / "web" / "node_modules" / ".bin").mkdir(parents=True)
+    head_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=git_repo, text=True).strip()
+
+    with coverage_ratchet._ephemeral_worktree(git_repo, head_sha) as (wt_dir, wt_env):
+        assert wt_dir.is_dir()
+        assert (wt_dir / ".venv").is_symlink()
+        assert str(wt_dir / ".venv" / "bin") in wt_env["PATH"]
+        assert wt_env["COVERAGE_FILE"] == str(wt_dir / ".coverage")
+    assert not wt_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("commands", "timeout", "expected_rc", "expected_err_substr"),
+    [
+        pytest.param([f"{sys.executable} -c \"print('ok')\""], 10, 0, None, id="command_passes"),
+        pytest.param([f"{sys.executable} -c \"import sys; sys.exit(2)\""], 10, 2, "failed (exit 2)", id="command_fails"),
+        pytest.param([f"{sys.executable} -c \"import time; time.sleep(2)\""], 1, 124, "timed out", id="command_timeout"),
+    ],
+)
+def test_execute_worktree_commands(
+    tmp_path: Path, commands: list[str], timeout: int, expected_rc: int, expected_err_substr: str | None
+):
+    """Verifies _execute_worktree_commands captures exit codes and timeouts."""
+    results, errs = coverage_ratchet._execute_worktree_commands(commands, tmp_path, dict(os.environ), timeout)
+    assert results[0]["returncode"] == expected_rc
+    if expected_err_substr is None:
+        assert errs == []
+    else:
+        assert any(expected_err_substr in e for e in errs)
+
+
+@pytest.mark.parametrize(("mode", "exp_errors", "exp_warnings"), [("error", ["m"], []), ("warn", [], ["m"])])
+def test_append_cov_issue(mode: str, exp_errors: list[str], exp_warnings: list[str]):
+    """Verifies _append_cov_issue routes messages to errors or warnings by mode."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    coverage_ratchet._append_cov_issue("m", mode, errors, warnings)
+    assert errors == exp_errors
+    assert warnings == exp_warnings

@@ -536,3 +536,159 @@ def compare_coverage_snapshots(
         "regressed_files": regressed_files,
     }
 
+
+def _build_worktree_env(tmp_dir: Path) -> dict[str, str]:
+    """Build environment for ephemeral worktrees with `.venv/bin` and `node_modules/.bin` on PATH."""
+    env = dict(os.environ)
+    extra_bins: list[str] = []
+    for venv_bin in (tmp_dir / ".venv" / "bin", tmp_dir / ".venv" / "Scripts"):
+        if venv_bin.exists():
+            extra_bins.append(str(venv_bin))
+    root_nm_bin = tmp_dir / "node_modules" / ".bin"
+    if root_nm_bin.exists():
+        extra_bins.append(str(root_nm_bin))
+    try:
+        for child in sorted(tmp_dir.iterdir()):
+            if child.is_dir() and not child.name.startswith("."):
+                sub_bin = child / "node_modules" / ".bin"
+                if sub_bin.exists():
+                    extra_bins.append(str(sub_bin))
+    except OSError:
+        pass
+
+    if extra_bins:
+        cur_path = env.get("PATH", "")
+        env["PATH"] = os.pathsep.join([*extra_bins, cur_path] if cur_path else extra_bins)
+    env["COVERAGE_FILE"] = str(tmp_dir / ".coverage")
+    return env
+
+
+@contextlib.contextmanager
+def _ephemeral_worktree(repo: Path, commit_sha: str) -> Iterator[tuple[Path, dict[str, str]]]:
+    """Materialize `commit_sha` in a detached `/tmp` worktree with symlinked dependency caches."""
+    tmp_dir = Path(tempfile.mkdtemp(prefix="atomic-verify-"))
+    try:
+        _git(["worktree", "add", "--detach", str(tmp_dir), commit_sha], repo)
+        for cache_dir in ("node_modules", ".venv"):
+            src_cache = repo / cache_dir
+            dst_cache = tmp_dir / cache_dir
+            if src_cache.exists() and not dst_cache.exists():
+                os.symlink(str(src_cache), str(dst_cache))
+        for child in repo.iterdir():
+            if child.is_dir() and not child.name.startswith("."):
+                sub_nm = child / "node_modules"
+                dst_sub = tmp_dir / child.name / "node_modules"
+                if sub_nm.exists() and (tmp_dir / child.name).is_dir() and not dst_sub.exists():
+                    os.symlink(str(sub_nm), str(dst_sub))
+        yield (tmp_dir, _build_worktree_env(tmp_dir))
+    finally:
+        _git(["worktree", "remove", "--force", str(tmp_dir)], repo, check=False)
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        _git(["worktree", "prune"], repo, check=False)
+
+
+def _capture_baseline_coverage_snapshot(
+    repo: Path,
+    commit_sha: str,
+    tree_sha: str,
+    label: str,
+    cov_cfg: CoverageConfig,
+    cache: CoverageCache,
+    *,
+    pinned: bool = False,
+    timeout: int = 120,
+) -> CoverageSnapshot | None:
+    """Capture and cache a baseline coverage snapshot for `commit_sha` on cold start."""
+    cached = cache.get(tree_sha, cov_cfg.fingerprint, pin=pinned, label=label)
+    if cached is not None:
+        return cached
+    if not cov_cfg.command:
+        return None
+    try:
+        with _ephemeral_worktree(repo, commit_sha) as (wt_dir, wt_env):
+            proc = subprocess.run(
+                cov_cfg.command,
+                cwd=str(wt_dir),
+                env=wt_env,
+                shell=True,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+            if proc.returncode != 0:
+                return None
+            snap = collect_worktree_coverage(wt_dir, cov_cfg.report_paths)
+            if snap is not None:
+                cache.put(
+                    tree_sha,
+                    cov_cfg.fingerprint,
+                    snap,
+                    commit_sha=commit_sha,
+                    label=label,
+                    pinned=pinned,
+                )
+            return snap
+    except (subprocess.TimeoutExpired, OSError, subprocess.CalledProcessError, ValueError):
+        return None
+
+
+def _execute_worktree_commands(
+    commands: list[str],
+    tmp_dir: Path,
+    wt_env: dict[str, str],
+    command_timeout: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Run user verification commands in the isolated ephemeral worktree."""
+    results: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for cmd_str in commands:
+        try:
+            proc = subprocess.run(
+                cmd_str,
+                cwd=str(tmp_dir),
+                env=wt_env,
+                shell=True,
+                text=True,
+                capture_output=True,
+                timeout=command_timeout,
+            )
+            results.append(
+                {
+                    "command": cmd_str,
+                    "returncode": proc.returncode,
+                    "stdout": proc.stdout,
+                    "stderr": proc.stderr,
+                }
+            )
+            if proc.returncode != 0:
+                errors.append(
+                    f"Verification command failed (exit {proc.returncode}) in isolated staged worktree: {cmd_str}"
+                )
+                break
+        except subprocess.TimeoutExpired as exc:
+            results.append(
+                {
+                    "command": cmd_str,
+                    "returncode": 124,
+                    "stdout": exc.stdout.decode("utf-8", errors="replace")
+                    if isinstance(exc.stdout, bytes)
+                    else (exc.stdout or ""),
+                    "stderr": f"Command timed out after {command_timeout}s",
+                }
+            )
+            errors.append(
+                f"Verification command timed out after {command_timeout}s in isolated staged worktree: {cmd_str}"
+            )
+            break
+    return results, errors
+
+
+def _append_cov_issue(
+    msg: str, mode: str, errors: list[str], warnings: list[str]
+) -> None:
+    if mode == "error":
+        errors.append(msg)
+    else:
+        warnings.append(msg)
+
