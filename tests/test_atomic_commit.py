@@ -76,8 +76,8 @@ def temp_git_repo(tmp_path: Path) -> Path:
         pytest.param(
             {
                 "core/models.py": "class Player:\n    pass\n",
-                "core/engine.py": "from .models import Player\ndef tick():\n    return Player()\n",
-                "app.py": "from core.engine import tick\n",
+                "core/engine.py": "from .models import (\n    Player,  # noqa: E402\n)\ndef tick():\n    return Player()\n",
+                "app.py": "from core.engine import tick\nfrom core.models import *\n",
             },
             [
                 ["core/models.py"],

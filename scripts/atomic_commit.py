@@ -244,7 +244,7 @@ TS_BRACED_EXPORT_RE = re.compile(
 #   from foo.bar import a, b
 #   import foo.bar
 PY_FROM_IMPORT_RE = re.compile(
-    r"""^[ \t]*from[ \t]+(\.*[A-Za-z0-9_.]*)[ \t]+import[ \t]+([^\n#]+)""",
+    r"""^[ \t]*from[ \t]+(\.*[A-Za-z0-9_.]*)[ \t]+import[ \t]+(?:\(([^)]*)\)|([^\n#]+))""",
     re.MULTILINE,
 )
 PY_DIRECT_IMPORT_RE = re.compile(
@@ -503,11 +503,15 @@ def extract_file_imports(
     elif ext in PY_EXTENSIONS:
         for m in PY_FROM_IMPORT_RE.finditer(cleaned):
             mod_spec = m.group(1).strip()
-            names_part = m.group(2).strip().strip("()")
+            names_part = (m.group(2) if m.group(2) is not None else m.group(3)).strip().strip("()")
             target = resolve_py_import(rel_path, mod_spec, known_repo_files)
             for raw_item in names_part.split(","):
                 item = raw_item.strip().split(" as ")[0].strip()
-                if not item or item == "*":
+                if not item:
+                    continue
+                if item == "*":
+                    if target and target != rel_path:
+                        resolved.setdefault(target, ImportedSymbols(target_file=target))
                     continue
                 # Check if `from pkg import submodule` points to `pkg/submodule.py`
                 sub_spec = f"{mod_spec}.{item}" if mod_spec else item
