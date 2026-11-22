@@ -112,3 +112,36 @@ def test_stage_file_lines_splits_single_tracked_hunk_and_handles_deletes(git_rep
     code_chunks.stage_file_lines(git_repo, "app.py", [(2, 2)])
     blob_full = subprocess.check_output(["git", "show", ":app.py"], cwd=git_repo, text=True)
     assert blob_full == "a = 100\nb = 200\n"
+
+
+@pytest.mark.parametrize(
+    ("lang", "source", "expected_symbols"),
+    [
+        pytest.param(
+            "py",
+            "import os\nCONST = 1\nclass Box:\n    pass\ndef run():\n    return Box()\n",
+            [["os"], ["CONST"], ["Box"], ["run"]],
+            id="python_top_level",
+        ),
+        pytest.param("py", "def broken(:\n", [[]], id="python_syntax_fallback"),
+        pytest.param(
+            "ts",
+            "import { Base } from './base';\n\nexport interface Item {\n  id: string;\n}\n\nexport function make(id: string): Item {\n  return { id };\n}\n",
+            [[], ["Item"], ["make"]],
+            id="typescript_decls",
+        ),
+        pytest.param("ts", "", [], id="typescript_empty"),
+    ],
+)
+def test_extract_py_and_ts_chunks(
+    lang: str, source: str, expected_symbols: list[list[str]]
+):
+    """Verifies _extract_py_chunks and _extract_ts_chunks top-level symbol extraction."""
+    lines = source.splitlines()
+    chunks = (
+        code_chunks._extract_py_chunks(source, len(lines))
+        if lang == "py"
+        else code_chunks._extract_ts_chunks(lines)
+    )
+    assert [c["symbols"] for c in chunks] == expected_symbols
+
