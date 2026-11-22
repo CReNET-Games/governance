@@ -302,6 +302,48 @@ def test_analyze_file_chunks_python_closure_and_typescript_slices(git_repo: Path
     assert "Item" in ts_analysis["chunks"][2]["depends_on_symbols"]
 
 
+def test_check_staged_intrafile_refs_catches_syntax_and_missing_helpers_but_allows_shadowing():
+    """Verifies static AST intra-file ref check flags missing unstaged helpers without false-positive parameter shadowing."""
+    wt = (
+        "DEFAULT_V = 10\n\n"
+        "def _helper(val: int) -> int:\n"
+        "    return val + DEFAULT_V\n\n"
+        "def public_fn(x: int) -> int:\n"
+        "    return _helper(x)\n\n"
+        "def shadowed_fn(_helper: int, items: list[int]) -> list[int]:\n"
+        "    return [_helper + i for i in items]\n"
+    )
+
+    # Syntax error in staged slice fails loudly
+    syn_errs = code_chunks.check_staged_intrafile_refs("m.py", "def broken(:\n", wt)
+    assert len(syn_errs) == 1
+    assert "syntax error" in syn_errs[0].lower()
+
+    # Staging public_fn without _helper fails
+    missing_errs = code_chunks.check_staged_intrafile_refs(
+        "m.py",
+        "def public_fn(x: int) -> int:\n    return _helper(x)\n",
+        wt,
+    )
+    assert len(missing_errs) == 1
+    assert "symbol '_helper'" in missing_errs[0]
+
+    # Staging shadowed_fn with parameter `_helper` and comprehension does NOT false-positive
+    ok_errs = code_chunks.check_staged_intrafile_refs(
+        "m.py",
+        "def shadowed_fn(_helper: int, items: list[int]) -> list[int]:\n    return [_helper + i for i in items]\n",
+        wt,
+    )
+    assert ok_errs == []
+
+    # Annotations/defaults/lambdas resolve against module scope cleanly
+    ann_errs = code_chunks.check_staged_intrafile_refs(
+        "m.py",
+        "def uses_default(x: int = DEFAULT_V, fn=lambda a: _helper(a)) -> int:\n    return fn(x)\n",
+        wt,
+    )
+    assert len(ann_errs) == 2
+
 
 def test_chunk_edge_cases_modified_test_file_and_line_errors(git_repo: Path):
     """Verifies line-range validation, modified HEAD chunk statuses, and test_lines chunk packing."""

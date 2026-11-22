@@ -649,3 +649,179 @@ def analyze_file_chunks(
         "suggested_line_slices": suggested,
     }
 
+
+def _collect_pattern_names(target: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(target):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+    return names
+
+
+def _collect_local_bound_names(stmts: list[ast.stmt]) -> set[str]:
+    """Collect names bound directly within a function/method body (excluding nested scopes)."""
+    bound: set[str] = set()
+    global_or_nonlocal: set[str] = set()
+    queue: list[ast.AST] = list(stmts)
+    while queue:
+        node = queue.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+            continue
+        if isinstance(node, ast.Global):
+            global_or_nonlocal.update(node.names)
+            continue
+        if isinstance(node, ast.Nonlocal):
+            global_or_nonlocal.update(node.names)
+            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                name = alias.asname or alias.name.split(".", 1)[0]
+                if name and name != "*":
+                    bound.add(name)
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            bound.add(node.id)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+        if isinstance(node, ast.Lambda):
+            continue
+        for child in ast.iter_child_nodes(node):
+            queue.append(child)
+    return bound - global_or_nonlocal
+
+
+def _all_arg_nodes(args: ast.arguments) -> list[ast.arg]:
+    """Return every parameter `ast.arg` node declared in a function or lambda signature."""
+    items = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+    if args.vararg:
+        items.append(args.vararg)
+    if args.kwarg:
+        items.append(args.kwarg)
+    return items
+
+
+def _iter_arg_defaults(args: ast.arguments) -> list[ast.expr]:
+    """Return all default value expressions attached to a function or lambda signature."""
+    return [*args.defaults, *(d for d in args.kw_defaults if d is not None)]
+
+
+def _walk_function_or_lambda(
+    node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+    missing_syms: set[str],
+    shadowed: set[str],
+    found: dict[str, int],
+) -> None:
+    """Walk decorators/annotations/defaults under outer scope, then body with parameter shadowing."""
+    all_args = _all_arg_nodes(node.args)
+    if not isinstance(node, ast.Lambda):
+        for dec in node.decorator_list:
+            _walk_scope_for_missing_refs(dec, missing_syms, shadowed, found)
+        if node.returns is not None:
+            _walk_scope_for_missing_refs(node.returns, missing_syms, shadowed, found)
+        for arg in all_args:
+            if arg.annotation is not None:
+                _walk_scope_for_missing_refs(arg.annotation, missing_syms, shadowed, found)
+
+    for dflt in _iter_arg_defaults(node.args):
+        _walk_scope_for_missing_refs(dflt, missing_syms, shadowed, found)
+
+    inner_shadowed = set(shadowed) | {a.arg for a in all_args}
+    if isinstance(node, ast.Lambda):
+        _walk_scope_for_missing_refs(node.body, missing_syms, inner_shadowed, found)
+        return
+
+    inner_shadowed |= _collect_local_bound_names(node.body)
+    for stmt in node.body:
+        _walk_scope_for_missing_refs(stmt, missing_syms, inner_shadowed, found)
+
+
+def _walk_comprehension(
+    node: ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp,
+    missing_syms: set[str],
+    shadowed: set[str],
+    found: dict[str, int],
+) -> None:
+    """Walk comprehension clauses while progressively shadowing each generator's target bindings."""
+    comp_shadowed = set(shadowed)
+    for gen in node.generators:
+        _walk_scope_for_missing_refs(gen.iter, missing_syms, comp_shadowed, found)
+        comp_shadowed |= _collect_pattern_names(gen.target)
+        for cond in gen.ifs:
+            _walk_scope_for_missing_refs(cond, missing_syms, comp_shadowed, found)
+    if isinstance(node, ast.DictComp):
+        _walk_scope_for_missing_refs(node.key, missing_syms, comp_shadowed, found)
+        _walk_scope_for_missing_refs(node.value, missing_syms, comp_shadowed, found)
+    else:
+        _walk_scope_for_missing_refs(node.elt, missing_syms, comp_shadowed, found)
+
+
+def _walk_scope_for_missing_refs(
+    node: ast.AST,
+    missing_syms: set[str],
+    shadowed: set[str],
+    found: dict[str, int],
+) -> None:
+    """Recursively record unshadowed loads of `missing_syms` across lexical Python scopes."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        _walk_function_or_lambda(node, missing_syms, shadowed, found)
+        return
+
+    if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+        _walk_comprehension(node, missing_syms, shadowed, found)
+        return
+
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+        if node.id in missing_syms and node.id not in shadowed:
+            found.setdefault(node.id, getattr(node, "lineno", 1))
+        return
+
+    for child in ast.iter_child_nodes(node):
+        _walk_scope_for_missing_refs(child, missing_syms, shadowed, found)
+
+
+def _py_module_defs(tree: ast.Module) -> set[str]:
+    defs: set[str] = set()
+    for stmt in tree.body:
+        _, syms = _py_stmt_kind_and_symbols(stmt)
+        defs.update(syms)
+    return defs
+
+
+def check_staged_intrafile_refs(
+    rel_path: str, staged_content: str, wt_content: str | None
+) -> list[str]:
+    """Detect Python syntax errors or references to unstaged intra-file top-level symbols."""
+    if Path(rel_path).suffix.lower() not in PY_EXTENSIONS:
+        return []
+
+    try:
+        staged_tree = ast.parse(staged_content, filename=rel_path)
+    except SyntaxError as exc:
+        return [
+            f"Staged file '{rel_path}' has a Python syntax error at line {exc.lineno}: {exc.msg}."
+        ]
+
+    if wt_content is None:
+        return []
+
+    try:
+        wt_tree = ast.parse(wt_content, filename=rel_path)
+    except SyntaxError:
+        return []
+
+    staged_defs = _py_module_defs(staged_tree)
+    wt_defs = _py_module_defs(wt_tree)
+    missing_top_defs = wt_defs - staged_defs
+    if not missing_top_defs:
+        return []
+
+    found: dict[str, int] = {}
+    for stmt in staged_tree.body:
+        _walk_scope_for_missing_refs(stmt, missing_top_defs, set(), found)
+
+    return [
+        f"Staged slice of '{rel_path}' references intra-file symbol '{sym}' (line {lineno}), "
+        f"which is only defined in unstaged working-tree lines of '{rel_path}'."
+        for sym, lineno in sorted(found.items(), key=lambda kv: (kv[1], kv[0]))
+    ]
