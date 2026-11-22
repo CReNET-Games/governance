@@ -198,3 +198,167 @@ def _parse_json_coverage(raw_text: str, report_file: Path, worktree_root: Path) 
         cov = sum(1 for hits in s_map.values() if isinstance(hits, (int, float)) and hits > 0)
         files[norm_p] = FileCoverageStat(total=tot, covered=cov, missed=max(0, tot - cov))
     return _finalize_snapshot_from_files(files)
+
+
+def _parse_cobertura_coverage(raw_text: str, worktree_root: Path) -> CoverageSnapshot:
+    root = ET.fromstring(raw_text)
+    source_prefixes: list[Path] = []
+    for src_el in root.findall(".//sources/source"):
+        if src_el.text and src_el.text.strip():
+            source_prefixes.append(Path(src_el.text.strip()))
+
+    line_hits: dict[str, dict[int, int]] = {}
+    for cls_el in root.findall(".//class"):
+        fname = cls_el.attrib.get("filename", "").strip()
+        if not fname:
+            continue
+        norm_p = _normalize_cov_file_path(fname, worktree_root)
+        if norm_p and not (worktree_root / norm_p).exists() and source_prefixes:
+            for sp in source_prefixes:
+                resolved_norm = _normalize_cov_file_path(str(sp / fname), worktree_root)
+                if resolved_norm:
+                    norm_p = resolved_norm
+                    break
+        if not norm_p:
+            continue
+        fmap = line_hits.setdefault(norm_p, {})
+        for line_el in cls_el.findall(".//line"):
+            try:
+                lno = int(line_el.attrib["number"])
+                hits = int(line_el.attrib.get("hits", "0"))
+            except (KeyError, ValueError):
+                continue
+            fmap[lno] = max(fmap.get(lno, 0), hits)
+
+    xml_files = {
+        p: FileCoverageStat(
+            total=len(lmap),
+            covered=sum(1 for h in lmap.values() if h > 0),
+            missed=sum(1 for h in lmap.values() if h <= 0),
+        )
+        for p, lmap in line_hits.items()
+    }
+    fb_tot = int(root.attrib.get("lines-valid", "0") or 0)
+    fb_cov = int(root.attrib.get("lines-covered", "0") or 0)
+    return _finalize_snapshot_from_files(xml_files, fallback_total=fb_tot, fallback_covered=fb_cov)
+
+
+def _parse_lcov_coverage(raw_text: str, worktree_root: Path) -> CoverageSnapshot:
+    lcov_hits: dict[str, dict[int, int]] = {}
+    lcov_summary_fallback: dict[str, tuple[int, int]] = {}
+    cur_file: str | None = None
+    cur_lf: int | None = None
+    cur_lh: int | None = None
+
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("SF:"):
+            cur_file = _normalize_cov_file_path(line[3:], worktree_root)
+            cur_lf = None
+            cur_lh = None
+        elif line.startswith("DA:") and cur_file is not None:
+            parts = line[3:].split(",")
+            if len(parts) >= 2:
+                try:
+                    lno = int(parts[0])
+                    hits = int(parts[1])
+                    fmap = lcov_hits.setdefault(cur_file, {})
+                    fmap[lno] = max(fmap.get(lno, 0), hits)
+                except ValueError:
+                    pass
+        elif line.startswith("LF:") and cur_file is not None:
+            try:
+                cur_lf = int(line[3:])
+            except ValueError:
+                pass
+        elif line.startswith("LH:") and cur_file is not None:
+            try:
+                cur_lh = int(line[3:])
+            except ValueError:
+                pass
+        elif line == "end_of_record":
+            if cur_file is not None and cur_file not in lcov_hits and cur_lf is not None:
+                cov = cur_lh if cur_lh is not None else 0
+                lcov_summary_fallback[cur_file] = (cur_lf, cov)
+            cur_file = None
+
+    lcov_files: dict[str, FileCoverageStat] = {}
+    for p, lmap in lcov_hits.items():
+        lcov_files[p] = FileCoverageStat(
+            total=len(lmap),
+            covered=sum(1 for h in lmap.values() if h > 0),
+            missed=sum(1 for h in lmap.values() if h <= 0),
+        )
+    for p, (tot, cov) in lcov_summary_fallback.items():
+        if p not in lcov_files:
+            lcov_files[p] = FileCoverageStat(total=tot, covered=cov, missed=max(0, tot - cov))
+
+    return _finalize_snapshot_from_files(lcov_files)
+
+
+def parse_coverage_report(report_file: Path, worktree_root: Path) -> CoverageSnapshot:
+    """Parse Istanbul JSON (`coverage-summary.json` / `coverage-final.json`), Python `coverage.json`, LCOV, or Cobertura XML."""
+    raw_text = report_file.read_text(encoding="utf-8", errors="replace")
+    suffix = report_file.suffix.lower()
+    stripped = raw_text.lstrip()
+
+    if suffix == ".json" or stripped.startswith("{"):
+        return _parse_json_coverage(raw_text, report_file, worktree_root)
+    if suffix == ".xml" or stripped.startswith("<"):
+        return _parse_cobertura_coverage(raw_text, worktree_root)
+    return _parse_lcov_coverage(raw_text, worktree_root)
+
+
+def merge_coverage_snapshots(snapshots: list[CoverageSnapshot]) -> CoverageSnapshot:
+    """Merge multiple coverage snapshots (e.g. monorepo packages or TS + Python)."""
+    if not snapshots:
+        return CoverageSnapshot(total_lines=0, covered_lines=0, missed_lines=0, pct=100.0, files={})
+    if len(snapshots) == 1:
+        return snapshots[0]
+
+    merged_files: dict[str, FileCoverageStat] = {}
+    fallback_tot = 0
+    fallback_cov = 0
+    for snap in snapshots:
+        if snap.files:
+            for p, st in snap.files.items():
+                prev = merged_files.get(p)
+                if prev is None or st.covered > prev.covered or st.total > prev.total:
+                    merged_files[p] = st
+        else:
+            fallback_tot += snap.total_lines
+            fallback_cov += snap.covered_lines
+
+    base = _finalize_snapshot_from_files(merged_files)
+    tot = base.total_lines + fallback_tot
+    cov = base.covered_lines + fallback_cov
+    mis = max(0, tot - cov)
+    pct = round(100.0 * cov / tot, 2) if tot > 0 else 100.0
+    return CoverageSnapshot(
+        total_lines=tot,
+        covered_lines=cov,
+        missed_lines=mis,
+        pct=pct,
+        files=merged_files,
+    )
+
+
+def collect_worktree_coverage(
+    worktree_dir: Path, report_paths: list[str]
+) -> CoverageSnapshot | None:
+    """Collect and parse configured or auto-discovered coverage report(s) from `worktree_dir`."""
+    if report_paths:
+        parsed_list: list[CoverageSnapshot] = []
+        for rel_rp in report_paths:
+            cand = worktree_dir / rel_rp
+            if cand.is_file():
+                parsed_list.append(parse_coverage_report(cand, worktree_dir))
+        if not parsed_list:
+            return None
+        return merge_coverage_snapshots(parsed_list)
+
+    for default_rel in DEFAULT_REPORT_CANDIDATES:
+        cand = worktree_dir / default_rel
+        if cand.is_file():
+            return parse_coverage_report(cand, worktree_dir)
+    return None
