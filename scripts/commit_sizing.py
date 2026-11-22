@@ -61,6 +61,41 @@ TEST_DIR_SEGMENTS = frozenset(
     {"test", "tests", "__tests__", "__mocks__", "e2e", "cypress", "playwright"}
 )
 
+PY_DOCSTRING_EXTS = frozenset({".py", ".pyi"})
+C_STYLE_COMMENT_EXTS = frozenset(
+    {
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".mts",
+        ".cts",
+        ".css",
+        ".scss",
+        ".less",
+        ".go",
+        ".rs",
+        ".java",
+        ".c",
+        ".cpp",
+        ".h",
+        ".hpp",
+        ".cs",
+        ".swift",
+        ".kt",
+        ".jsonc",
+    }
+)
+HTML_COMMENT_EXTS = frozenset({".html", ".htm", ".xml", ".svg", ".md", ".vue", ".svelte"})
+HASH_COMMENT_EXTS = frozenset(
+    {".sh", ".bash", ".zsh", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf", ".rb", ".pl", ".mk"}
+)
+HASH_COMMENT_BASENAMES = frozenset(
+    {"Makefile", "Dockerfile", ".gitignore", ".dockerignore", ".aiignore"}
+)
+
 
 @dataclass(frozen=True)
 class SizingConfig:
@@ -269,6 +304,177 @@ def classify_file_role(rel_path: str, config: SizingConfig | None = None) -> str
     return "production"
 
 
+def _count_unescaped(text: str, token: str) -> int:
+    """Count non-overlapping, unescaped occurrences of `token` in `text`."""
+    count = 0
+    idx = 0
+    n = len(text)
+    tok_len = len(token)
+    while idx < n:
+        if text[idx] == "\\":
+            idx += 2
+            continue
+        if text.startswith(token, idx):
+            count += 1
+            idx += tok_len
+            continue
+        idx += 1
+    return count
+
+
+def _process_c_style_line(
+    raw_line: str, in_block: bool, *, fallback_mode: bool = False
+) -> tuple[bool, bool]:
+    """Scan a single C/JS/TS/CSS-family line returning `(is_comment_only, next_in_block)`."""
+    stripped = raw_line.strip()
+    if fallback_mode and not in_block and (
+        stripped == "*" or stripped.startswith("* ") or stripped.startswith("*/")
+    ):
+        if stripped.startswith("*/"):
+            after = stripped[2:].strip()
+            if not after or after.startswith("//"):
+                return (True, False)
+        else:
+            return (True, False)
+
+    n = len(raw_line)
+    idx = 0
+    in_quote: str | None = None
+    saw_code = False
+
+    while idx < n:
+        ch = raw_line[idx]
+        if in_block:
+            if raw_line.startswith("*/", idx):
+                in_block = False
+                idx += 2
+                continue
+            idx += 1
+            continue
+
+        if in_quote is not None:
+            saw_code = True
+            if ch == "\\":
+                idx += 2
+                continue
+            if ch == in_quote:
+                in_quote = None
+            idx += 1
+            continue
+
+        if ch in (" ", "\t", "\r", "\n"):
+            idx += 1
+            continue
+
+        if raw_line.startswith("//", idx):
+            break
+
+        if raw_line.startswith("/*", idx):
+            in_block = True
+            idx += 2
+            continue
+
+        if ch in ('"', "'", "`"):
+            in_quote = ch
+            saw_code = True
+            idx += 1
+            continue
+
+        saw_code = True
+        idx += 1
+
+    return (not saw_code, in_block)
+
+
+def _process_html_comment_line(raw_line: str, in_block: bool) -> tuple[bool, bool]:
+    """Scan an HTML/XML/Markdown line for `<!-- ... -->`, returning `(is_comment_only, next_in_block)`."""
+    n = len(raw_line)
+    idx = 0
+    saw_code = False
+
+    while idx < n:
+        if in_block:
+            end_idx = raw_line.find("-->", idx)
+            if end_idx == -1:
+                break
+            in_block = False
+            idx = end_idx + 3
+            continue
+
+        if raw_line[idx] in (" ", "\t", "\r", "\n"):
+            idx += 1
+            continue
+
+        if raw_line.startswith("<!--", idx):
+            in_block = True
+            idx += 4
+            continue
+
+        saw_code = True
+        idx += 1
+
+    return (not saw_code, in_block)
+
+
+def classify_source_lines(
+    rel_path: str, lines: list[str], *, fallback_mode: bool = False
+) -> tuple[set[int], set[int]]:
+    """Return `(blank_line_nums, comment_line_nums)` using 1-based line numbers."""
+    p = Path(rel_path.replace("\\", "/"))
+    ext = p.suffix.lower()
+    name = p.name
+
+    blank_nums: set[int] = set()
+    comment_nums: set[int] = set()
+
+    py_delim: str | None = None
+    c_in_block = False
+    html_in_block = False
+
+    for lineno, raw_line in enumerate(lines, start=1):
+        stripped = raw_line.strip()
+        if not stripped:
+            blank_nums.add(lineno)
+            continue
+
+        if ext in PY_DOCSTRING_EXTS:
+            if py_delim is not None:
+                comment_nums.add(lineno)
+                if _count_unescaped(stripped, py_delim) % 2 == 1:
+                    py_delim = None
+                continue
+
+            if stripped.startswith("#"):
+                if not (lineno == 1 and stripped.startswith("#!")):
+                    comment_nums.add(lineno)
+                continue
+
+            if stripped.startswith(('"""', "'''", 'r"""', "r'''", 'R"""', "R'''")):
+                delim = '"""' if '"""' in stripped[:5] else "'''"
+                prefix_end = stripped.find(delim) + 3
+                rest = stripped[prefix_end:]
+                comment_nums.add(lineno)
+                if _count_unescaped(rest, delim) % 2 == 0:
+                    py_delim = delim
+                continue
+
+        elif ext in C_STYLE_COMMENT_EXTS:
+            is_comment, c_in_block = _process_c_style_line(
+                raw_line, c_in_block, fallback_mode=fallback_mode
+            )
+            if is_comment:
+                comment_nums.add(lineno)
+
+        elif ext in HTML_COMMENT_EXTS:
+            is_comment, html_in_block = _process_html_comment_line(raw_line, html_in_block)
+            if is_comment:
+                comment_nums.add(lineno)
+
+        elif ext in HASH_COMMENT_EXTS or name in HASH_COMMENT_BASENAMES:
+            if stripped.startswith("#") and not (lineno == 1 and stripped.startswith("#!")):
+                comment_nums.add(lineno)
+
+    return (blank_nums, comment_nums)
 def _read_text_safe(path: Path) -> str | None:
     """Read a UTF-8 file if it is a regular non-binary file."""
     if path.is_symlink() or not path.is_file():

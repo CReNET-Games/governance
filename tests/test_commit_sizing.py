@@ -35,6 +35,76 @@ def test_classify_file_role(rel_path: str, expected_role: str):
     assert commit_sizing.classify_file_role(rel_path) == expected_role
 
 
+@pytest.mark.parametrize(
+    ("raw_line", "in_block", "fallback_mode", "expected"),
+    [
+        pytest.param(" * fallback bullet", False, True, (True, False), id="fallback_star"),
+        pytest.param(" */", False, True, (True, False), id="fallback_close_block"),
+        pytest.param(" */ // end", False, True, (True, False), id="fallback_close_with_comment"),
+        pytest.param(
+            'const s = "a\\"b"; /* open block',
+            False,
+            False,
+            (False, True),
+            id="escaped_quote_before_block",
+        ),
+    ],
+)
+def test_c_style_and_unescaped_comment_edge_cases(
+    raw_line: str, in_block: bool, fallback_mode: bool, expected: tuple[bool, bool]
+):
+    """Verifies escaped delimiter counting and fallback C-style comment heuristics."""
+    assert commit_sizing._process_c_style_line(
+        raw_line, in_block, fallback_mode=fallback_mode
+    ) == expected
+    assert commit_sizing._count_unescaped('pre\\"\\"\\"post"""', '"""') == 1
+
+
+@pytest.mark.parametrize(
+    ("rel_path", "lines", "expected_blank", "expected_comment"),
+    [
+        pytest.param(
+            "engine.py",
+            ["#!/usr/bin/env python3", "# header", '"""doc"""', "", "x = 1"],
+            {4},
+            {2, 3},
+            id="python_basic",
+        ),
+        pytest.param(
+            "doc.py",
+            ['"""escaped \\""" inside', 'still doc"""'],
+            set(),
+            {1, 2},
+            id="python_escaped_docstring",
+        ),
+        pytest.param(
+            "view.ts",
+            ["/**", " * doc", " */", "// note", "", "export const v = 1;"],
+            {5},
+            {1, 2, 3, 4},
+            id="typescript_block_and_line",
+        ),
+        pytest.param(
+            "index.html",
+            ["<!-- start", "middle", "end -->", "  <div>body</div>", "  <!-- note -->"],
+            set(),
+            {1, 2, 3, 5},
+            id="html_block_and_inline",
+        ),
+        pytest.param("Makefile", ["# build rule", "", "test:"], {2}, {1}, id="makefile_hash"),
+    ],
+)
+def test_classify_source_lines_languages(
+    rel_path: str, lines: list[str], expected_blank: set[int], expected_comment: set[int]
+):
+    """Verifies classify_source_lines across Python, TypeScript, HTML, and Makefile inputs."""
+    assert commit_sizing.classify_source_lines(rel_path, lines) == (
+        expected_blank,
+        expected_comment,
+    )
+
+
+
 def test_read_text_safe_handles_missing_binary_non_utf8_and_oserror(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
