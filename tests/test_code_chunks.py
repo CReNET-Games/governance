@@ -255,3 +255,85 @@ def test_compute_suggested_line_slices_topological_and_cycles(
         == expected
     )
 
+
+def test_analyze_file_chunks_python_closure_and_typescript_slices(git_repo: Path):
+    """Verifies chunking puts bottom-of-file helper dependencies before callers and handles TS files."""
+    py_file = git_repo / "pipeline.py"
+    py_file.write_text(
+        '"""Pipeline module."""\n'
+        "import os\n\n"
+        "def stage_one(x: int) -> int:\n"
+        "    a = x + 1\n"
+        "    b = a + 2\n"
+        "    return _bottom_helper(b)\n\n"
+        "def independent(y: int) -> int:\n"
+        "    p = y * 2\n"
+        "    q = p + 3\n"
+        "    return q\n\n"
+        "def _bottom_helper(v: int) -> int:\n"
+        "    return v * 10\n",
+        encoding="utf-8",
+    )
+
+    py_analysis = code_chunks.analyze_file_chunks(git_repo, "pipeline.py", max_chunk_lines=7)
+    slices = py_analysis["suggested_line_slices"]
+    assert len(slices) >= 2
+    # Slice 1 must include _bottom_helper (chunk 4, lines 13-15) before stage_one (chunk 2)
+    helper_chunk = next(c for c in py_analysis["chunks"] if c["symbols"] == ["_bottom_helper"])
+    stage_one_chunk = next(c for c in py_analysis["chunks"] if c["symbols"] == ["stage_one"])
+    assert helper_chunk["index"] in slices[0]["chunk_indices"]
+    assert stage_one_chunk["index"] not in slices[0]["chunk_indices"]
+    _, parsed_ranges = code_chunks.parse_line_spec(slices[0]["line_spec"])
+    covered = {ln for s, e in parsed_ranges for ln in range(s, e + 1)}
+    assert set(range(helper_chunk["start_line"], helper_chunk["end_line"] + 1)) <= covered
+
+    ts_file = git_repo / "view.ts"
+    ts_file.write_text(
+        "import { Base } from './base';\n\n"
+        "export interface Item {\n  id: string;\n}\n\n"
+        "export function makeItem(id: string): Item {\n"
+        "  return { id };\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    ts_analysis = code_chunks.analyze_file_chunks(git_repo, "view.ts", max_chunk_lines=5)
+    assert ts_analysis["chunk_count"] == 3
+    assert ts_analysis["chunks"][1]["symbols"] == ["Item"]
+    assert "Item" in ts_analysis["chunks"][2]["depends_on_symbols"]
+
+
+
+def test_chunk_edge_cases_modified_test_file_and_line_errors(git_repo: Path):
+    """Verifies line-range validation, modified HEAD chunk statuses, and test_lines chunk packing."""
+    test_file = git_repo / "tests" / "test_suite.py"
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text(
+        "import pytest\n\n"
+        "def test_existing():\n"
+        "    assert 1 == 1\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=git_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "add test"], cwd=git_repo, check=True, capture_output=True)
+
+    test_file.write_text(
+        "import pytest\n\n"
+        "def test_existing():\n"
+        "    assert 2 == 2\n\n"
+        "def test_new_a():\n"
+        "    a = 1\n"
+        "    assert a == 1\n\n"
+        "def test_new_b():\n"
+        "    b = 2\n"
+        "    assert b == 2\n",
+        encoding="utf-8",
+    )
+    analysis = code_chunks.analyze_file_chunks(git_repo, "tests/test_suite.py", max_chunk_lines=4)
+    statuses = [c["status"] for c in analysis["chunks"]]
+    assert statuses == ["unchanged", "modified", "added", "added"]
+    assert len(analysis["suggested_line_slices"]) >= 2
+
+    with pytest.raises(FileNotFoundError):
+        code_chunks.stage_file_lines(git_repo, "missing.py", [(1, 1)])
+    with pytest.raises(ValueError):
+        code_chunks.stage_file_lines(git_repo, "tests/test_suite.py", [(1, 999)])

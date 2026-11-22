@@ -501,3 +501,151 @@ def _compute_suggested_line_slices(
         for slice_num, idxs in enumerate(slices, start=1)
     ]
 
+
+def _changed_worktree_lines(repo: Path, rel_path: str, wt_lines: list[str]) -> tuple[bool, set[int]]:
+    """Return `(in_head, changed_wt_lines)` comparing working-tree lines against `HEAD`."""
+    head_res = subprocess.run(
+        ["git", "show", f"HEAD:{rel_path}"],
+        cwd=str(repo),
+        capture_output=True,
+        check=False,
+    )
+    if head_res.returncode != 0:
+        return False, set(range(1, len(wt_lines) + 1))
+
+    head_lines = head_res.stdout.decode("utf-8", errors="replace").splitlines()
+    changed: set[int] = set()
+    matcher = difflib.SequenceMatcher(None, head_lines, wt_lines, autojunk=False)
+    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag in ("insert", "replace"):
+            changed.update(range(j1 + 1, j2 + 1))
+    return True, changed
+
+
+def _extract_raw_chunks_for_path(
+    rel_path: str, wt_text: str, wt_lines: list[str]
+) -> list[dict[str, Any]]:
+    """Dispatch raw top-level symbol chunk extraction by file extension."""
+    ext = Path(rel_path).suffix.lower()
+    if ext in PY_EXTENSIONS:
+        return _extract_py_chunks(wt_text, len(wt_lines))
+    if ext in TS_JS_EXTENSIONS:
+        return _extract_ts_chunks(wt_lines)
+    return [
+        {
+            "kind": "file",
+            "start_line": 1,
+            "end_line": max(1, len(wt_lines)),
+            "symbols": [],
+            "raw_used": set(),
+        }
+    ]
+
+
+def _build_chunk_record(
+    idx: int,
+    raw_chunk: dict[str, Any],
+    *,
+    file_role: str,
+    total_lines: int,
+    blank_nums: set[int],
+    comment_nums: set[int],
+    in_head: bool,
+    changed_wt_lines: set[int],
+    all_top_symbols: set[str],
+) -> dict[str, Any]:
+    """Compute line budgets, change status, and intra-file deps for one raw chunk."""
+    s, e = int(raw_chunk["start_line"]), int(raw_chunk["end_line"])
+    stats = LineStats(file_role=file_role)
+    code_or_test_lines: list[int] = []
+    for lineno in range(s, min(e, total_lines) + 1):
+        if lineno in blank_nums:
+            stats.blank_lines += 1
+        elif lineno in comment_nums:
+            stats.comment_lines += 1
+        elif file_role == "test":
+            stats.test_lines += 1
+            code_or_test_lines.append(lineno)
+        else:
+            stats.logic_lines += 1
+            code_or_test_lines.append(lineno)
+
+    if not in_head or (code_or_test_lines and all(l in changed_wt_lines for l in code_or_test_lines)):
+        status = "added"
+    elif any(l in changed_wt_lines for l in range(s, min(e, total_lines) + 1)):
+        status = "modified"
+    else:
+        status = "unchanged"
+
+    own_syms = set(raw_chunk["symbols"])
+    return {
+        "index": idx,
+        "kind": raw_chunk["kind"],
+        "start_line": s,
+        "end_line": e,
+        "symbols": raw_chunk["symbols"],
+        "status": status,
+        "depends_on_symbols": sorted((raw_chunk["raw_used"] & all_top_symbols) - own_syms),
+        "logic_lines": stats.logic_lines,
+        "test_lines": stats.test_lines,
+        "comment_lines": stats.comment_lines,
+    }
+
+
+def analyze_file_chunks(
+    repo: Path,
+    rel_path: str,
+    *,
+    sizing_config: SizingConfig | None = None,
+    max_chunk_lines: int | None = None,
+) -> dict[str, Any]:
+    """Analyze top-level symbols, line counts, intra-file deps, and suggested `--lines` slices."""
+    wt_path = repo / rel_path
+    if not wt_path.is_file():
+        return {
+            "file": rel_path,
+            "file_role": "production",
+            "chunk_count": 0,
+            "chunks": [],
+            "suggested_line_slices": [],
+        }
+
+    cfg = sizing_config or load_sizing_config(repo)
+    file_role = classify_file_role(rel_path, config=cfg)
+    wt_text = wt_path.read_text(encoding="utf-8")
+    wt_lines = wt_text.splitlines()
+    in_head, changed_wt_lines = _changed_worktree_lines(repo, rel_path, wt_lines)
+    raw_chunks = _extract_raw_chunks_for_path(rel_path, wt_text, wt_lines)
+    all_top_symbols = {sym for ch in raw_chunks for sym in ch["symbols"]}
+    blank_nums, comment_nums = classify_source_lines(rel_path, wt_lines)
+
+    chunks_out = [
+        _build_chunk_record(
+            idx,
+            ch,
+            file_role=file_role,
+            total_lines=len(wt_lines),
+            blank_nums=blank_nums,
+            comment_nums=comment_nums,
+            in_head=in_head,
+            changed_wt_lines=changed_wt_lines,
+            all_top_symbols=all_top_symbols,
+        )
+        for idx, ch in enumerate(raw_chunks, start=1)
+    ]
+
+    target_max = max_chunk_lines if max_chunk_lines is not None else cfg.max_commit_lines
+    suggested = _compute_suggested_line_slices(
+        rel_path,
+        chunks_out,
+        file_role=file_role,
+        target_max=target_max,
+    )
+    return {
+        "file": rel_path,
+        "file_role": file_role,
+        "chunk_count": len(chunks_out),
+        "chunks": chunks_out,
+        "suggested_line_slices": suggested,
+    }
+
