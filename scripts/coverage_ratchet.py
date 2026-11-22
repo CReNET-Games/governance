@@ -192,3 +192,171 @@ def load_coverage_config(
         )
 
     return CoverageConfig(state="unconfigured")
+
+
+def _detect_js_pkg_manager(repo: Path) -> str:
+    if (repo / "pnpm-lock.yaml").is_file():
+        return "pnpm"
+    if (repo / "yarn.lock").is_file():
+        return "yarn"
+    return "npm"
+
+
+def _js_runner_prefixes(repo: Path) -> tuple[str, str]:
+    pm = _detect_js_pkg_manager(repo)
+    install_prefix = {"pnpm": "pnpm add -D", "yarn": "yarn add -D"}.get(pm, "npm install -D")
+    run_prefix = {"pnpm": "pnpm exec", "yarn": "yarn"}.get(pm, "npx")
+    return install_prefix, run_prefix
+
+
+def _collect_js_dependencies(repo: Path) -> set[str]:
+    pkg_files = [repo / "package.json"]
+    try:
+        for child in sorted(repo.iterdir()):
+            if child.is_dir() and not child.name.startswith(".") and child.name != "node_modules":
+                cand = child / "package.json"
+                if cand.is_file():
+                    pkg_files.append(cand)
+    except OSError:
+        pass
+
+    all_js_deps: set[str] = set()
+    for pf in pkg_files:
+        if not pf.is_file():
+            continue
+        try:
+            pdata = json.loads(pf.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(pdata, dict):
+            for section in ("dependencies", "devDependencies"):
+                sec = pdata.get(section)
+                if isinstance(sec, dict):
+                    all_js_deps.update(sec.keys())
+    return all_js_deps
+
+
+def _build_onboarding_payload(
+    stack: str,
+    *,
+    label: str,
+    command: str,
+    report_path: str,
+    package_installed: bool,
+    install_hint: str | None = None,
+) -> dict[str, Any]:
+    hint_note = f"(after `{install_hint}`) " if install_hint else ""
+    return {
+        "detected_stack": stack,
+        "package_installed": package_installed,
+        "install_hint": install_hint,
+        "suggested_config": {
+            "coverage": {
+                "command": command,
+                "report_path": report_path,
+                "mode": "warn",
+            }
+        },
+        "opt_out_config": {"coverage": False},
+        "message": (
+            f"Coverage is not configured in `.crenet-governance.json` (detected {label}). "
+            f"Ask the user once whether to configure `.crenet-governance.json` "
+            f'{hint_note}or opt out with `{{"coverage": false}}`.'
+        ),
+    }
+
+
+def _detect_vitest_stack(repo: Path) -> dict[str, Any] | None:
+    deps = _collect_js_dependencies(repo)
+    if "vitest" not in deps and not any(repo.glob("vitest.config.*")):
+        return None
+    install_prefix, run_prefix = _js_runner_prefixes(repo)
+    has_cov_pkg = bool({"@vitest/coverage-v8", "@vitest/coverage-istanbul"} & deps)
+    install_hint = None if has_cov_pkg else f"{install_prefix} @vitest/coverage-v8"
+    return _build_onboarding_payload(
+        "vitest",
+        label="Vitest",
+        command=f"{run_prefix} vitest run --coverage --coverage.reporter=json-summary",
+        report_path="coverage/coverage-summary.json",
+        package_installed=has_cov_pkg,
+        install_hint=install_hint,
+    )
+
+
+def _detect_jest_stack(repo: Path) -> dict[str, Any] | None:
+    deps = _collect_js_dependencies(repo)
+    if "jest" not in deps and not any(repo.glob("jest.config.*")):
+        return None
+    _, run_prefix = _js_runner_prefixes(repo)
+    return _build_onboarding_payload(
+        "jest",
+        label="Jest",
+        command=f"{run_prefix} jest --coverage --coverageReporters=json-summary",
+        report_path="coverage/coverage-summary.json",
+        package_installed=True,
+    )
+
+
+def _detect_pytest_stack(repo: Path) -> dict[str, Any] | None:
+    pyproject = repo / "pyproject.toml"
+    if not pyproject.is_file():
+        return None
+    py_text = _read_utf8_safe(pyproject) or ""
+    has_cov_pkg = "coverage" in py_text or "pytest-cov" in py_text
+    has_uv = (repo / "uv.lock").is_file()
+    install_hint = (
+        None if has_cov_pkg else ("uv add --dev coverage" if has_uv else "pip install coverage")
+    )
+    return _build_onboarding_payload(
+        "pytest",
+        label="Python/pytest",
+        command="coverage run -m pytest -q && coverage json -o coverage.json",
+        report_path="coverage.json",
+        package_installed=has_cov_pkg,
+        install_hint=install_hint,
+    )
+
+
+def _unknown_stack_onboarding_payload() -> dict[str, Any]:
+    return {
+        "detected_stack": "unknown",
+        "package_installed": False,
+        "install_hint": None,
+        "suggested_config": {
+            "coverage": {
+                "command": "<your-coverage-test-command>",
+                "report_path": "coverage/coverage-summary.json",
+                "mode": "warn",
+            }
+        },
+        "opt_out_config": {"coverage": False},
+        "message": (
+            "Coverage is not configured in `.crenet-governance.json`. "
+            "Ask the user once whether to configure a coverage command/report (`coverage-summary.json`, "
+            '`lcov.info`, `coverage.json`, or `coverage.xml`) or opt out with `{"coverage": false}`.'
+        ),
+    }
+
+
+OnboardingDetector = Callable[[Path], dict[str, Any] | None]
+STACK_ONBOARDING_DETECTORS: dict[str, OnboardingDetector] = {
+    "vitest": _detect_vitest_stack,
+    "jest": _detect_jest_stack,
+    "pytest": _detect_pytest_stack,
+}
+
+
+def detect_coverage_onboarding(
+    repo: Path, staged: dict[str, str] | None = None
+) -> dict[str, Any] | None:
+    """Detect test stack via `STACK_ONBOARDING_DETECTORS` and return a self-healing recipe."""
+    if load_coverage_config(repo, staged).state != "unconfigured":
+        return None
+
+    for detector in STACK_ONBOARDING_DETECTORS.values():
+        detected = detector(repo)
+        if detected is not None:
+            return detected
+
+    return _unknown_stack_onboarding_payload()
+

@@ -109,3 +109,100 @@ def test_load_coverage_config(
     assert cfg.report_paths == expected_reports
 
 
+
+
+@pytest.mark.parametrize(
+    ("repo_setup", "expected_stack", "expected_installed", "expected_hint_substr"),
+    [
+        pytest.param(
+            {
+                "package.json": '{"devDependencies": {"vitest": "^2.0.0"}}\n',
+                "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+            },
+            "vitest",
+            False,
+            "pnpm add -D @vitest/coverage-v8",
+            id="vitest_pnpm_missing_v8",
+        ),
+        pytest.param(
+            {
+                "package.json": '{"devDependencies": {"jest": "^29.0.0"}}\n',
+            },
+            "jest",
+            True,
+            None,
+            id="jest_builtin_coverage",
+        ),
+        pytest.param(
+            {
+                "pyproject.toml": '[project]\nname = "demo"\n',
+                "uv.lock": "version = 1\n",
+            },
+            "pytest",
+            False,
+            "uv add --dev coverage",
+            id="pytest_uv_missing_coverage",
+        ),
+        pytest.param(
+            {
+                "pyproject.toml": '[project]\nname = "demo"\n',
+                ".crenet-governance.json": '{"coverage": false}\n',
+            },
+            None,
+            None,
+            None,
+            id="explicit_opt_out",
+        ),
+        pytest.param({}, "unknown", False, None, id="unknown_fallback"),
+        pytest.param(
+            {"Cargo.toml": '[package]\nname = "game"\n'},
+            "cargo",
+            True,
+            None,
+            id="custom_registered_detector",
+        ),
+    ],
+)
+def test_detect_coverage_onboarding_across_stacks(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    repo_setup: dict[str, str],
+    expected_stack: str | None,
+    expected_installed: bool | None,
+    expected_hint_substr: str | None,
+):
+    """Verifies self-healing onboarding detects Vitest, Jest, Pytest, custom detectors, and opt-outs."""
+    for rel_path, content in repo_setup.items():
+        p = git_repo / rel_path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+
+    if expected_stack == "cargo":
+        monkeypatch.setitem(
+            coverage_ratchet.STACK_ONBOARDING_DETECTORS,
+            "cargo",
+            lambda r: (
+                coverage_ratchet._build_onboarding_payload(
+                    "cargo",
+                    label="Cargo",
+                    command="cargo llvm-cov --lcov --output-path lcov.info",
+                    report_path="lcov.info",
+                    package_installed=True,
+                )
+                if (r / "Cargo.toml").is_file()
+                else None
+            ),
+        )
+
+    onboarding = coverage_ratchet.detect_coverage_onboarding(git_repo)
+    if expected_stack is None:
+        assert onboarding is None
+    else:
+        assert onboarding is not None
+        assert onboarding["detected_stack"] == expected_stack
+        assert onboarding["package_installed"] is expected_installed
+        if expected_hint_substr is None:
+            assert onboarding["install_hint"] is None
+        else:
+            assert expected_hint_substr in (onboarding["install_hint"] or "")
+
