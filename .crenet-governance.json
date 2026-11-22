@@ -1,0 +1,7 @@
+{
+  "coverage": {
+    "command": "coverage run --source=scripts,mcp-server -m pytest -m 'not llm_eval' -q && coverage json -o coverage.json",
+    "report_path": "coverage.json",
+    "mode": "warn"
+  }
+}

@@ -1676,9 +1676,25 @@ def main(argv: list[str] | None = None) -> int:
                     else ""
                 )
                 print(
-                    f"  [{f['category']}] {f['path']} "
-                    f"(unstaged hunks: {f['unstaged_hunks']}, staged hunks: {f['staged_hunks']}){deps}"
+                    f"  [{f['category']}|{f['file_role']}] {f['path']} "
+                    f"(eff: {f['effective_lines']}, logic: {f['logic_lines']}, "
+                    f"test: {f['test_lines']}, comments: {f['comment_lines']}, "
+                    f"+{f['raw_additions']}/-{f['raw_deletions']}, "
+                    f"unstaged hunks: {f['unstaged_hunks']}, staged hunks: {f['staged_hunks']}){deps}"
                 )
+            ss = report["size_summary"]
+            print(
+                f"\nSize Summary: effective lines={ss['effective_lines']} "
+                f"(logic={ss['logic_lines']}, tests={ss['test_lines']}, "
+                f"comments={ss['comment_lines']}, generated={ss['generated_lines']}, "
+                f"raw=+{ss['raw_additions']}/-{ss['raw_deletions']}) | "
+                f"min ~{ss['recommended_min_commits']} commit(s), "
+                f"~{ss['recommended_pr_count']} PR(s)"
+            )
+            for warn in ss["warnings"]:
+                print(f"  ⚠ {warn}")
+            if report.get("coverage_onboarding"):
+                print(f"  ℹ {report['coverage_onboarding']['message']}")
             print("\nSuggested Topological Waves (earliest commit -> latest commit):")
             for i, wave in enumerate(report["topological_waves"], start=1):
                 print(f"  Wave {i}: {', '.join(wave)}")
@@ -1689,35 +1705,48 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.subcommand == "hunks":
-        fdiff = parse_single_file_diff(repo, args.file, cached=args.cached)
+        sizing_cfg = load_sizing_config(repo)
+        fdiff, hunk_dicts = get_file_hunks_with_stats(
+            repo, args.file, cached=args.cached, sizing_config=sizing_cfg
+        )
+        chunk_analysis: dict[str, Any] | None = None
+        if not args.cached and (
+            not fdiff.hunks
+            or any(hd["logic_lines"] > sizing_cfg.max_commit_lines for hd in hunk_dicts)
+        ):
+            chunk_analysis = analyze_file_chunks(repo, args.file, sizing_config=sizing_cfg)
+
         if args.json:
-            print(
-                json.dumps(
-                    {
-                        "file": fdiff.file_path,
-                        "hunk_count": len(fdiff.hunks),
-                        "hunks": [
-                            {
-                                "index": h.index,
-                                "header": h.header.strip(),
-                                "old_start": h.old_start,
-                                "old_count": h.old_count,
-                                "new_start": h.new_start,
-                                "new_count": h.new_count,
-                                "section_hint": h.section_hint,
-                                "preview": h.preview,
-                            }
-                            for h in fdiff.hunks
-                        ],
-                    },
-                    indent=2,
-                )
-            )
+            payload: dict[str, Any] = {
+                "file": fdiff.file_path,
+                "hunk_count": len(fdiff.hunks),
+                "hunks": hunk_dicts,
+            }
+            if chunk_analysis is not None:
+                payload["symbol_chunks"] = chunk_analysis["chunks"]
+                payload["suggested_line_slices"] = chunk_analysis["suggested_line_slices"]
+            print(json.dumps(payload, indent=2))
         else:
             print(f"File: {fdiff.file_path} ({len(fdiff.hunks)} hunks)")
-            for h in fdiff.hunks:
-                print(f"\n--- Hunk {h.index}: {h.header.strip()} ---")
+            for h, hd in zip(fdiff.hunks, hunk_dicts):
+                print(
+                    f"\n--- Hunk {h.index}: {h.header.strip()} "
+                    f"(logic: {hd['logic_lines']}, test: {hd['test_lines']}, "
+                    f"comments: {hd['comment_lines']}, +{hd['raw_additions']}/-{hd['raw_deletions']}) ---"
+                )
                 print(h.preview)
+            if chunk_analysis is not None:
+                _print_chunk_analysis(chunk_analysis, include_header=False)
+        return 0
+
+    if args.subcommand == "chunks":
+        chunk_analysis = analyze_file_chunks(
+            repo, args.file, max_chunk_lines=args.max_chunk_lines
+        )
+        if args.json:
+            print(json.dumps(chunk_analysis, indent=2))
+        else:
+            _print_chunk_analysis(chunk_analysis, include_header=True)
         return 0
 
     if args.subcommand == "stage":
@@ -1731,6 +1760,9 @@ def main(argv: list[str] | None = None) -> int:
         for spec in args.hunks:
             file_path, indices = _parse_hunk_spec(spec)
             stage_file_hunks(repo, file_path, indices)
+        for lspec in args.lines:
+            file_path, ranges = parse_line_spec(lspec)
+            stage_file_lines(repo, file_path, ranges)
 
         staged = get_staged_files(repo)
         print(f"Staged {len(staged)} file(s): {', '.join(sorted(staged))}")
@@ -1742,21 +1774,50 @@ def main(argv: list[str] | None = None) -> int:
             commands=args.cmd,
             skip_worktree=args.skip_worktree,
             command_timeout=args.timeout,
+            max_commit_lines=args.max_commit_lines,
+            max_commit_files=args.max_commit_files,
+            count_tests=args.include_tests,
+            count_comments=args.include_comments,
+            coverage_cmd=args.coverage_cmd,
+            coverage_reports=args.coverage_report or None,
+            coverage_mode=args.coverage_mode,
         )
         if args.json:
             print(json.dumps(report, indent=2))
         else:
+            sm = report["size_metrics"]
+            cov = report.get("coverage") or {}
+            snap = cov.get("snapshot")
             if report["passed"]:
                 print(
                     f"✔ Staged slice verified ({len(report['staged_files'])} file(s)): "
-                    f"{', '.join(report['staged_files'])}"
+                    f"{', '.join(report['staged_files'])} "
+                    f"[effective lines: {sm['effective_lines']} "
+                    f"(logic: {sm['logic_lines']}, tests: {sm['test_lines']}, comments: {sm['comment_lines']})]"
                 )
                 for res in report["command_results"]:
-                    print(f"  ✔ Command passed: {res['command']}")
+                    if res["returncode"] == 0:
+                        print(f"  ✔ Command passed: {res['command']}")
+                if snap is not None:
+                    vs_h = cov.get("vs_head")
+                    delta_str = (
+                        f" | vs HEAD: {vs_h['delta_missed']:+d} missed ({vs_h['delta_pct']:+.2f}%)"
+                        if vs_h is not None
+                        else ""
+                    )
+                    print(
+                        f"  ✔ Coverage ({cov['status']}): {snap['pct']:.2f}% "
+                        f"({snap['covered_lines']}/{snap['total_lines']} lines, "
+                        f"{snap['missed_lines']} missed){delta_str}"
+                    )
+                for warn in report["warnings"]:
+                    print(f"  ⚠ {warn}")
             else:
                 print("❌ Staged slice verification FAILED:", file=sys.stderr)
                 for err in report["errors"]:
                     print(f"  - {err}", file=sys.stderr)
+                for warn in report["warnings"]:
+                    print(f"  ⚠ {warn}", file=sys.stderr)
                 for res in report["command_results"]:
                     if res["returncode"] != 0:
                         if res["stdout"]:

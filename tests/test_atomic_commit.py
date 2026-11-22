@@ -669,6 +669,127 @@ def test_mid_docstring_edit_classified_as_comment_via_full_blob(
     assert res["size_metrics"]["effective_lines"] == expected_effective_lines
 
 
+@pytest.mark.parametrize(
+    ("staged_files", "max_lines", "max_files", "expected_eff_lines", "expected_warn_substr"),
+    [
+        pytest.param(["tests/test_big_module.py", "uv.lock"], 20, 10, 0, None, id="tests_and_lockfile_only"),
+        pytest.param(
+            ["src/big_module.py", "tests/test_big_module.py"],
+            20,
+            10,
+            25,
+            "Commit size warning",
+            id="oversized_production_slice",
+        ),
+        pytest.param(
+            ["src/p1.py", "src/p2.py", "src/p3.py", "tests/test_big_module.py", "uv.lock"],
+            200,
+            2,
+            3,
+            "Commit scope warning",
+            id="scope_exceeds_max_files",
+        ),
+    ],
+)
+def test_verify_emits_non_blocking_size_and_file_warnings(
+    temp_git_repo: Path,
+    capsys,
+    staged_files: list[str],
+    max_lines: int,
+    max_files: int,
+    expected_eff_lines: int,
+    expected_warn_substr: str | None,
+):
+    """Verifies size and file-count thresholds emit warnings without blocking verify (passed stays True)."""
+    (temp_git_repo / "src").mkdir(parents=True, exist_ok=True)
+    (temp_git_repo / "tests").mkdir(parents=True, exist_ok=True)
+    (temp_git_repo / "src/big_module.py").write_text(
+        "".join(f"x_{i} = {i}\n" for i in range(25)), encoding="utf-8"
+    )
+    (temp_git_repo / "tests/test_big_module.py").write_text(
+        "".join(f"def test_{i}(): assert True\n" for i in range(30)), encoding="utf-8"
+    )
+    (temp_git_repo / "uv.lock").write_text("".join(f"pkg-{i}\n" for i in range(50)), encoding="utf-8")
+    for idx in range(1, 4):
+        (temp_git_repo / f"src/p{idx}.py").write_text(f"val = {idx}\n", encoding="utf-8")
+
+    atomic_commit.main(["--repo", str(temp_git_repo), "stage", "--reset", "--files", *staged_files])
+    res = atomic_commit.verify_staged_slice(
+        temp_git_repo, skip_worktree=True, max_commit_lines=max_lines, max_commit_files=max_files
+    )
+    assert res["passed"] is True
+    assert res["errors"] == []
+    assert res["size_metrics"]["effective_lines"] == expected_eff_lines
+    if expected_warn_substr is None:
+        assert res["warnings"] == []
+    else:
+        assert any(expected_warn_substr in w for w in res["warnings"])
+        capsys.readouterr()
+        rc = atomic_commit.main(
+            [
+                "--repo",
+                str(temp_git_repo),
+                "verify",
+                "--skip-worktree",
+                "--max-commit-lines",
+                str(max_lines),
+                "--max-commit-files",
+                str(max_files),
+            ]
+        )
+        assert rc == 0
+        assert expected_warn_substr in capsys.readouterr().out
+
+
+def test_status_recommends_stacked_prs_when_exceeding_max_pr_lines(temp_git_repo: Path, capsys):
+    """Verifies inspect_status and CLI flags report recommended_min_commits, recommended_pr_count, and PR warnings."""
+    mod_a = temp_git_repo / "mod_a.py"
+    base_a = [f"a_{i} = {i}\n" for i in range(1, 40)]
+    mod_a.write_text("".join(base_a), encoding="utf-8")
+    subprocess.run(["git", "add", "mod_a.py"], cwd=temp_git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "feat: add mod_a"],
+        cwd=temp_git_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Create 2 separate hunks totaling 24 logic lines in mod_a.py
+    for idx in range(0, 12):
+        base_a[idx] = f"a_{idx + 1} = {idx + 100}\n"
+    for idx in range(26, 38):
+        base_a[idx] = f"a_{idx + 1} = {idx + 200}\n"
+    mod_a.write_text("".join(base_a), encoding="utf-8")
+
+    # Add untracked mod_b.py with 20 logic lines (44 lines across 2 modified+new files? 12*2+12*2? Wait: 12 removed + 12 added per hunk!)
+    mod_b = temp_git_repo / "mod_b.py"
+    mod_b.write_text("".join(f"b_{i} = {i}\n" for i in range(12)), encoding="utf-8")
+
+    report = atomic_commit.inspect_status(temp_git_repo, max_commit_lines=20, max_pr_lines=30)
+    ss = report["size_summary"]
+    assert ss["effective_lines"] == 60  # 48 churn in mod_a + 12 in mod_b
+    assert ss["recommended_min_commits"] == 3
+    assert ss["recommended_pr_count"] == 2
+    assert any("PR size warning" in w and "stacked PRs" in w for w in ss["warnings"])
+    assert any("mod_a.py" in w and "hunks" in w for w in ss["warnings"])
+
+    capsys.readouterr()
+    rc = atomic_commit.main(
+        [
+            "--repo",
+            str(temp_git_repo),
+            "status",
+            "--max-commit-lines",
+            "20",
+            "--max-pr-lines",
+            "30",
+        ]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Size Summary:" in out
+    assert "PR size warning" in out
+
 
 @pytest.mark.parametrize(
     ("extra_files", "staged_files", "skip_worktree", "expected_cov_status", "expected_warn_substr"),
@@ -857,6 +978,155 @@ def test_verify_coverage_ratchet_cold_start_warn_error_and_dead_code_deletion(
         assert res["warnings"] == []
 
 
+@pytest.mark.parametrize(
+    ("cli_max_lines", "expect_size_warning"),
+    [
+        pytest.param(None, True, id="config_threshold_warns"),
+        pytest.param(50, False, id="cli_override_passes_cleanly"),
+    ],
+)
+def test_governance_sizing_config_integration_and_cli_override(
+    temp_git_repo: Path,
+    cli_max_lines: int | None,
+    expect_size_warning: bool,
+):
+    """Verifies `.crenet-governance.json` sizing rules drive status/verify and explicit flags override."""
+    import json as _json
+
+    (temp_git_repo / "src/generated").mkdir(parents=True)
+    (temp_git_repo / "src/proto").mkdir(parents=True)
+    (temp_git_repo / "tests/fixtures").mkdir(parents=True)
+    (temp_git_repo / "src/domain").mkdir(parents=True)
+
+    (temp_git_repo / "src/generated/routes.ts").write_text(
+        "".join(f"export const r{i} = {i};\n" for i in range(40)), encoding="utf-8"
+    )
+    (temp_git_repo / "src/proto/msg.pb.ts").write_text(
+        "".join(f"export const p{i} = {i};\n" for i in range(30)), encoding="utf-8"
+    )
+    (temp_git_repo / "tests/fixtures/seed.ts").write_text(
+        "".join(f"export const f{i} = {i};\n" for i in range(25)), encoding="utf-8"
+    )
+    (temp_git_repo / "src/domain/service.py").write_text(
+        "".join(f"s_{i} = {i}\n" for i in range(12)), encoding="utf-8"
+    )
+    (temp_git_repo / ".crenet-governance.json").write_text(
+        _json.dumps(
+            {
+                "coverage": False,
+                "sizing": {
+                    "max_commit_lines": 10,
+                    "max_pr_lines": 25,
+                    "generated_extensions": [".pb.ts"],
+                    "generated_globs": ["src/generated/**"],
+                    "test_globs": ["**/fixtures/**"],
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    status = atomic_commit.inspect_status(temp_git_repo)
+    by_path = {f["path"]: f for f in status["files"]}
+    assert by_path["src/generated/routes.ts"]["file_role"] == "generated"
+    assert by_path["src/generated/routes.ts"]["effective_lines"] == 0
+    assert by_path["src/proto/msg.pb.ts"]["file_role"] == "generated"
+    assert by_path["tests/fixtures/seed.ts"]["file_role"] == "test"
+    assert status["size_summary"]["max_commit_lines"] == 10
+    assert status["size_summary"]["effective_lines"] == 28
+
+    atomic_commit.main(
+        [
+            "--repo",
+            str(temp_git_repo),
+            "stage",
+            "--reset",
+            "--files",
+            ".crenet-governance.json",
+            "src/generated/routes.ts",
+            "src/proto/msg.pb.ts",
+            "tests/fixtures/seed.ts",
+            "src/domain/service.py",
+        ]
+    )
+
+    cli_args = ["--repo", str(temp_git_repo), "verify", "--skip-worktree"]
+    if cli_max_lines is not None:
+        cli_args.extend(["--max-commit-lines", str(cli_max_lines)])
+    assert atomic_commit.main(cli_args) == 0
+
+    res = atomic_commit.verify_staged_slice(
+        temp_git_repo, skip_worktree=True, max_commit_lines=cli_max_lines
+    )
+    assert res["passed"] is True
+    assert res["size_metrics"]["generated_files"] == 2
+    assert res["size_metrics"]["test_files"] == 1
+    assert res["size_metrics"]["max_commit_lines"] == (cli_max_lines or 10)
+    assert bool(any("Commit size warning" in w for w in res["warnings"])) is expect_size_warning
+
+
+def test_cli_chunks_and_hunks_suggest_line_slices(temp_git_repo: Path, capsys):
+    """Verifies CLI chunks --json and hunks surface top-level symbol chunks and suggested `--lines` slices."""
+    import json as _json
+
+    (temp_git_repo / ".crenet-governance.json").write_text('{"coverage": false}\n', encoding="utf-8")
+    subprocess.run(["git", "add", ".crenet-governance.json"], cwd=temp_git_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "opt out cov"], cwd=temp_git_repo, check=True, capture_output=True)
+
+    (temp_git_repo / "svc.py").write_text(
+        "def _foundation(n: int) -> int:\n    return n + 1\n\n"
+        "def high_level(n: int) -> int:\n    return _foundation(n) * 2\n",
+        encoding="utf-8",
+    )
+
+    capsys.readouterr()
+    assert atomic_commit.main(["--repo", str(temp_git_repo), "chunks", "svc.py", "--json"]) == 0
+    chunks_json = _json.loads(capsys.readouterr().out)
+    assert chunks_json["chunk_count"] == 2
+    assert len(chunks_json["suggested_line_slices"]) >= 1
+
+    assert atomic_commit.main(["--repo", str(temp_git_repo), "hunks", "svc.py"]) == 0
+    assert "Suggested `--lines` Slices:" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("stage_args", "expected_passed", "expected_err_substr"),
+    [
+        pytest.param(["--lines", "svc.py:3-5"], False, "symbol '_foundation'", id="missing_intrafile_dep_fails"),
+        pytest.param(
+            ["--lines", "svc.py:1-2", "--lines", "svc.py:1-2"],
+            True,
+            None,
+            id="bottom_up_and_repeated_flags_pass",
+        ),
+    ],
+)
+def test_cli_stage_lines_and_intrafile_verify(
+    temp_git_repo: Path,
+    stage_args: list[str],
+    expected_passed: bool,
+    expected_err_substr: str | None,
+):
+    """Verifies CLI `stage --lines` supports partial slices and verify flags missing intra-file symbols."""
+    (temp_git_repo / ".crenet-governance.json").write_text('{"coverage": false}\n', encoding="utf-8")
+    subprocess.run(["git", "add", ".crenet-governance.json"], cwd=temp_git_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "opt out cov"], cwd=temp_git_repo, check=True, capture_output=True)
+
+    (temp_git_repo / "svc.py").write_text(
+        "def _foundation(n: int) -> int:\n    return n + 1\n\n"
+        "def high_level(n: int) -> int:\n    return _foundation(n) * 2\n",
+        encoding="utf-8",
+    )
+
+    assert atomic_commit.main(["--repo", str(temp_git_repo), "stage", "--reset", *stage_args]) == 0
+    res = atomic_commit.verify_staged_slice(temp_git_repo, skip_worktree=True)
+    assert res["passed"] is expected_passed
+    if expected_err_substr is None:
+        assert res["errors"] == []
+    else:
+        assert any(expected_err_substr in e for e in res["errors"])
 
 
 @pytest.mark.parametrize(
