@@ -73,6 +73,7 @@ def get_markdown_docs() -> list[Path]:
         AGENTS_DIR / "AGENTS.md",
         *get_rule_files(),
         *get_skill_files(),
+        *sorted(SKILLS_DIR.glob("*/references/*.md")),
     ]
     return [d for d in docs if d.exists()]
 
