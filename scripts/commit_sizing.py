@@ -263,6 +263,8 @@ def load_sizing_config(
         generated_globs=gen_globs,
         test_globs=tst_globs,
     )
+
+
 def classify_file_role(rel_path: str, config: SizingConfig | None = None) -> str:
     """Classify a repository-relative path as 'generated', 'test', or 'production'."""
     rel_posix = rel_path.replace("\\", "/")
@@ -475,6 +477,150 @@ def classify_source_lines(
                 comment_nums.add(lineno)
 
     return (blank_nums, comment_nums)
+
+
+@dataclass
+class LineStats:
+    file_role: str = "production"
+    raw_additions: int = 0
+    raw_deletions: int = 0
+    logic_lines: int = 0
+    test_lines: int = 0
+    comment_lines: int = 0
+    blank_lines: int = 0
+    generated_lines: int = 0
+
+    def add_other(self, other: LineStats) -> None:
+        self.raw_additions += other.raw_additions
+        self.raw_deletions += other.raw_deletions
+        self.logic_lines += other.logic_lines
+        self.test_lines += other.test_lines
+        self.comment_lines += other.comment_lines
+        self.blank_lines += other.blank_lines
+        self.generated_lines += other.generated_lines
+
+    def effective_lines(self, *, count_tests: bool = False, count_comments: bool = False) -> int:
+        if self.file_role == "generated":
+            return 0
+        if self.file_role == "test":
+            if not count_tests:
+                return 0
+            return self.test_lines + (self.comment_lines if count_comments else 0)
+        return self.logic_lines + (self.comment_lines if count_comments else 0)
+
+
+def _route_line_into_stats(
+    stats: LineStats,
+    lineno: int,
+    blank_nums: set[int],
+    comment_nums: set[int],
+) -> None:
+    if lineno in blank_nums:
+        stats.blank_lines += 1
+    elif lineno in comment_nums:
+        stats.comment_lines += 1
+    elif stats.file_role == "test":
+        stats.test_lines += 1
+    else:
+        stats.logic_lines += 1
+
+
+def compute_hunk_line_stats(
+    rel_path: str,
+    hunk: Any,
+    *,
+    old_classified: tuple[set[int], set[int]] | None = None,
+    new_classified: tuple[set[int], set[int]] | None = None,
+    config: SizingConfig | None = None,
+) -> LineStats:
+    """Compute categorized line counts for a single parsed DiffHunk."""
+    role = classify_file_role(rel_path, config=config)
+    stats = LineStats(file_role=role)
+
+    old_lineno = hunk.old_start
+    new_lineno = hunk.new_start
+    added: list[tuple[int, str]] = []
+    removed: list[tuple[int, str]] = []
+
+    for line in hunk.body_lines:
+        if line.startswith(" "):
+            old_lineno += 1
+            new_lineno += 1
+        elif line.startswith("+") and not line.startswith("+++"):
+            stats.raw_additions += 1
+            added.append((new_lineno, line[1:].rstrip("\r\n")))
+            new_lineno += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            stats.raw_deletions += 1
+            removed.append((old_lineno, line[1:].rstrip("\r\n")))
+            old_lineno += 1
+
+    if role == "generated":
+        stats.generated_lines = stats.raw_additions + stats.raw_deletions
+        return stats
+
+    if added:
+        if new_classified is not None:
+            new_blank, new_comment = new_classified
+            for lineno, _ in added:
+                _route_line_into_stats(stats, lineno, new_blank, new_comment)
+        else:
+            fb_blank, fb_comment = classify_source_lines(
+                rel_path, [txt for _, txt in added], fallback_mode=True
+            )
+            for idx in range(1, len(added) + 1):
+                _route_line_into_stats(stats, idx, fb_blank, fb_comment)
+
+    if removed:
+        if old_classified is not None:
+            old_blank, old_comment = old_classified
+            for lineno, _ in removed:
+                _route_line_into_stats(stats, lineno, old_blank, old_comment)
+        else:
+            fb_blank, fb_comment = classify_source_lines(
+                rel_path, [txt for _, txt in removed], fallback_mode=True
+            )
+            for idx in range(1, len(removed) + 1):
+                _route_line_into_stats(stats, idx, fb_blank, fb_comment)
+
+    return stats
+
+
+def compute_hunk_dict(
+    rel_path: str,
+    hunk: Any,
+    *,
+    old_classified: tuple[set[int], set[int]] | None = None,
+    new_classified: tuple[set[int], set[int]] | None = None,
+    config: SizingConfig | None = None,
+) -> dict:
+    """Serialize a DiffHunk together with its categorized line statistics."""
+    stats = compute_hunk_line_stats(
+        rel_path,
+        hunk,
+        old_classified=old_classified,
+        new_classified=new_classified,
+        config=config,
+    )
+    return {
+        "index": hunk.index,
+        "header": hunk.header.strip(),
+        "old_start": hunk.old_start,
+        "old_count": hunk.old_count,
+        "new_start": hunk.new_start,
+        "new_count": hunk.new_count,
+        "section_hint": hunk.section_hint,
+        "preview": hunk.preview,
+        "file_role": stats.file_role,
+        "raw_additions": stats.raw_additions,
+        "raw_deletions": stats.raw_deletions,
+        "logic_lines": stats.logic_lines,
+        "test_lines": stats.test_lines,
+        "comment_lines": stats.comment_lines,
+        "blank_lines": stats.blank_lines,
+    }
+
+
 def _read_text_safe(path: Path) -> str | None:
     """Read a UTF-8 file if it is a regular non-binary file."""
     if path.is_symlink() or not path.is_file():
@@ -489,3 +635,22 @@ def _read_text_safe(path: Path) -> str | None:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
         return None
+
+
+def _stats_from_full_text(
+    rel_path: str, text: str | None, *, config: SizingConfig | None = None
+) -> LineStats:
+    """Compute LineStats treating every line of `text` as an added line."""
+    role = classify_file_role(rel_path, config=config)
+    stats = LineStats(file_role=role)
+    if text is None:
+        return stats
+    lines = text.splitlines()
+    stats.raw_additions = len(lines)
+    if role == "generated":
+        stats.generated_lines = len(lines)
+        return stats
+    blank_nums, comment_nums = classify_source_lines(rel_path, lines)
+    for lineno in range(1, len(lines) + 1):
+        _route_line_into_stats(stats, lineno, blank_nums, comment_nums)
+    return stats

@@ -16,6 +16,19 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../s
 import commit_sizing  # noqa: E402
 
 
+@dataclass
+class _StubHunk:
+    index: int
+    header: str
+    old_start: int
+    old_count: int
+    new_start: int
+    new_count: int
+    section_hint: str
+    body_lines: list[str]
+    preview: str = ""
+
+
 @pytest.mark.parametrize(
     ("rel_path", "expected_role"),
     [
@@ -33,6 +46,106 @@ import commit_sizing  # noqa: E402
 def test_classify_file_role(rel_path: str, expected_role: str):
     """Verifies production, test, and generated/lockfile path classification."""
     assert commit_sizing.classify_file_role(rel_path) == expected_role
+
+
+@pytest.mark.parametrize(
+    ("count_tests", "count_comments", "expected_effective_lines"),
+    [
+        pytest.param(False, False, 3, id="default_logic_only"),
+        pytest.param(True, False, 7, id="include_tests"),
+        pytest.param(False, True, 11, id="include_prod_comments"),
+        pytest.param(True, True, 17, id="include_tests_and_comments"),
+    ],
+)
+def test_full_text_line_counting_skips_comments_tests_blanks_and_generated(
+    count_tests: bool,
+    count_comments: bool,
+    expected_effective_lines: int,
+):
+    """Verifies line classification excludes tests, comments/docstrings, blanks, and lockfiles by default."""
+    files = {
+        "src/engine.py": (
+            '"""Engine module.\n'
+            "Doc line 2.\n"
+            '"""\n'
+            "\n"
+            "# compute tick\n"
+            "def tick(x: int) -> int:\n"
+            "    return x + 1\n"
+        ),
+        "client/view.ts": (
+            "/**\n"
+            " * Render view.\n"
+            " */\n"
+            "// single line\n"
+            "\n"
+            "export const view = 1;\n"
+        ),
+        "tests/test_engine.py": (
+            "# test helper comment\n"
+            "\n"
+            "def test_tick():\n"
+            "    assert True\n"
+        ),
+        "client/view.test.ts": (
+            "// test spec\n"
+            "it('ok', () => {\n"
+            "});\n"
+        ),
+        "uv.lock": "version = 1\n" * 5,
+    }
+    agg = commit_sizing.LineStats()
+    total_eff = 0
+    for rel_path, content in files.items():
+        st = commit_sizing._stats_from_full_text(rel_path, content)
+        agg.add_other(st)
+        total_eff += st.effective_lines(count_tests=count_tests, count_comments=count_comments)
+
+    assert total_eff == expected_effective_lines
+    assert agg.logic_lines == 3
+    assert agg.test_lines == 4
+    assert agg.comment_lines == 10
+    assert agg.blank_lines == 3
+    assert agg.generated_lines == 5
+
+
+def test_hunk_stats_with_full_blob_context_and_html_hash_comments():
+    """Verifies hunk line stats resolve mid-docstring, HTML comment, and Makefile comment lines."""
+    py_lines = [
+        "def documented():",
+        '    """Start of docstring.',
+        "    Middle doc line.",
+        '    """',
+        "    return 42",
+    ]
+    cls_sets = commit_sizing.classify_source_lines("mod.py", py_lines)
+    hunk = _StubHunk(
+        index=1,
+        header="@@ -2,2 +2,2 @@",
+        old_start=2,
+        old_count=2,
+        new_start=2,
+        new_count=2,
+        section_hint="def documented():",
+        body_lines=["-    Old doc.", "+    Middle doc line."],
+    )
+    hd = commit_sizing.compute_hunk_dict(
+        "mod.py", hunk, old_classified=cls_sets, new_classified=cls_sets
+    )
+    assert hd["logic_lines"] == 0
+    assert hd["comment_lines"] == 2
+
+    html_blank, html_comment = commit_sizing.classify_source_lines(
+        "index.html", ["<!-- header", "banner -->", "<main>ok</main>"]
+    )
+    assert html_blank == set()
+    assert html_comment == {1, 2}
+
+    mk_blank, mk_comment = commit_sizing.classify_source_lines(
+        "Makefile", ["# build rule", "", "test:\n"]
+    )
+    assert mk_blank == {2}
+    assert mk_comment == {1}
 
 
 @pytest.mark.parametrize(
@@ -103,6 +216,65 @@ def test_classify_source_lines_languages(
         expected_comment,
     )
 
+
+@pytest.mark.parametrize(
+    ("rel_path", "body_lines", "expected"),
+    [
+        pytest.param(
+            "app.ts",
+            [
+                " const keep = 1;",
+                "-// old comment",
+                "-const oldVal = 1;",
+                "+ * mid doc bullet",
+                "+ */",
+                "+const newVal = 2;",
+            ],
+            commit_sizing.LineStats(
+                file_role="production",
+                raw_additions=3,
+                raw_deletions=2,
+                logic_lines=2,
+                comment_lines=3,
+                generated_lines=0,
+            ),
+            id="fallback_c_style_and_context",
+        ),
+        pytest.param(
+            "uv.lock",
+            ["-v1", "+v2", "+v3"],
+            commit_sizing.LineStats(
+                file_role="generated",
+                raw_additions=2,
+                raw_deletions=1,
+                logic_lines=0,
+                comment_lines=0,
+                generated_lines=3,
+            ),
+            id="generated_lockfile",
+        ),
+    ],
+)
+def test_hunk_stats_fallback_generated_and_context_lines(
+    rel_path: str, body_lines: list[str], expected: commit_sizing.LineStats
+):
+    """Verifies fallback comment classification, generated files, and raw/role stats in hunks."""
+    hunk = _StubHunk(
+        index=1,
+        header="@@ -1,1 +1,1 @@",
+        old_start=1,
+        old_count=1,
+        new_start=1,
+        new_count=1,
+        section_hint="",
+        body_lines=body_lines,
+    )
+    assert commit_sizing.compute_hunk_line_stats(rel_path, hunk) == expected
+
+
+def test_stats_from_full_text_none_returns_empty():
+    """Verifies _stats_from_full_text returns zero effective lines when text is None."""
+    assert commit_sizing._stats_from_full_text("missing.py", None).effective_lines() == 0
 
 
 def test_read_text_safe_handles_missing_binary_non_utf8_and_oserror(
