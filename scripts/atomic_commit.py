@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass, field
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -760,6 +761,15 @@ class DirtyFileEntry:
     unstaged_hunks: int
     staged_hunks: int
     depends_on_dirty: list[str] = field(default_factory=list)
+    file_role: str = "production"
+    raw_additions: int = 0
+    raw_deletions: int = 0
+    logic_lines: int = 0
+    test_lines: int = 0
+    comment_lines: int = 0
+    blank_lines: int = 0
+    generated_lines: int = 0
+    effective_lines: int = 0
 
 
 def _run_git_bytes(args: list[str], repo: Path) -> bytes:
@@ -871,10 +881,30 @@ def compute_topological_waves(
     return waves, cycles
 
 
-def inspect_status(repo: Path) -> dict:
-    """Inspect working tree + index and build a static dependency report."""
+def inspect_status(
+    repo: Path,
+    *,
+    count_tests: bool | None = None,
+    count_comments: bool | None = None,
+    max_commit_lines: int | None = None,
+    max_pr_lines: int | None = None,
+) -> dict:
+    """Inspect working tree + index, static dependencies, and categorized line budgets."""
+    sizing_cfg = load_sizing_config(
+        repo,
+        count_tests=count_tests,
+        count_comments=count_comments,
+        max_commit_lines=max_commit_lines,
+        max_pr_lines=max_pr_lines,
+    )
+    eff_count_tests = sizing_cfg.count_tests
+    eff_count_comments = sizing_cfg.count_comments
+    eff_max_commit_lines = sizing_cfg.max_commit_lines
+    eff_max_pr_lines = sizing_cfg.max_pr_lines
+
     raw = _run_git_bytes(["status", "--porcelain=v1", "-z", "-uall"], repo)
     known_files = get_all_repo_files(repo)
+    head_exists = has_head_commit(repo)
 
     entries: dict[str, DirtyFileEntry] = {}
     tokens = [t.decode("utf-8", errors="surrogateescape") for t in raw.split(b"\x00")]
@@ -910,6 +940,33 @@ def inspect_status(repo: Path) -> dict:
         if category in ("staged", "partially_staged"):
             staged_hunks = len(parse_single_file_diff(repo, rel_path, cached=True).hunks)
 
+        role = classify_file_role(rel_path, config=sizing_cfg)
+        full_path = repo / rel_path
+        if category == "untracked":
+            fstats = _stats_from_full_text(
+                rel_path, _read_text_safe(full_path), config=sizing_cfg
+            )
+        elif head_exists:
+            fstats = _compute_file_diff_stats(
+                repo, rel_path, base_ref="HEAD", sizing_config=sizing_cfg
+            )
+        elif category == "staged":
+            fstats = _stats_from_full_text(
+                rel_path,
+                _read_git_blob_text_safe(repo, f":{rel_path}"),
+                config=sizing_cfg,
+            )
+        elif category in ("unstaged", "partially_staged"):
+            fstats = _stats_from_full_text(
+                rel_path, _read_text_safe(full_path), config=sizing_cfg
+            )
+        else:
+            fstats = LineStats(file_role=role)
+
+        eff_lines = fstats.effective_lines(
+            count_tests=eff_count_tests, count_comments=eff_count_comments
+        )
+
         entries[rel_path] = DirtyFileEntry(
             path=rel_path,
             index_status=idx_s,
@@ -917,6 +974,15 @@ def inspect_status(repo: Path) -> dict:
             category=category,
             unstaged_hunks=unstaged_hunks,
             staged_hunks=staged_hunks,
+            file_role=fstats.file_role,
+            raw_additions=fstats.raw_additions,
+            raw_deletions=fstats.raw_deletions,
+            logic_lines=fstats.logic_lines,
+            test_lines=fstats.test_lines,
+            comment_lines=fstats.comment_lines,
+            blank_lines=fstats.blank_lines,
+            generated_lines=fstats.generated_lines,
+            effective_lines=eff_lines,
         )
 
     dirty_set = set(entries.keys())
@@ -940,12 +1006,78 @@ def inspect_status(repo: Path) -> dict:
 
     waves, cycles = compute_topological_waves(sorted(dirty_set), deps_map)
 
+    total_effective = sum(e.effective_lines for e in entries.values())
+    total_logic = sum(e.logic_lines for e in entries.values())
+    total_test = sum(e.test_lines for e in entries.values())
+    total_comment = sum(e.comment_lines for e in entries.values())
+    total_blank = sum(e.blank_lines for e in entries.values())
+    total_generated = sum(e.generated_lines for e in entries.values())
+    total_raw_add = sum(e.raw_additions for e in entries.values())
+    total_raw_del = sum(e.raw_deletions for e in entries.values())
+
+    if not entries:
+        recommended_min_commits = 0
+        recommended_pr_count = 0
+    else:
+        recommended_min_commits = (
+            max(1, math.ceil(total_effective / eff_max_commit_lines))
+            if eff_max_commit_lines > 0
+            else 1
+        )
+        recommended_pr_count = (
+            max(1, math.ceil(total_effective / eff_max_pr_lines))
+            if eff_max_pr_lines > 0
+            else 1
+        )
+
+    size_warnings: list[str] = []
+    if eff_max_pr_lines > 0 and total_effective > eff_max_pr_lines:
+        size_warnings.append(
+            f"PR size warning: dirty tree has {total_effective} effective lines "
+            f"(target <= {eff_max_pr_lines}; tests={'included' if eff_count_tests else 'excluded'}, "
+            f"comments={'included' if eff_count_comments else 'excluded'}). "
+            f"Recommend splitting into ~{recommended_pr_count} stacked PRs."
+        )
+    for rel_path in sorted(entries):
+        entry = entries[rel_path]
+        if eff_max_commit_lines > 0 and entry.effective_lines > eff_max_commit_lines:
+            total_hunks = entry.unstaged_hunks + entry.staged_hunks
+            if total_hunks > 1:
+                size_warnings.append(
+                    f"File '{rel_path}' has {entry.effective_lines} effective lines across {total_hunks} hunks "
+                    f"(> {eff_max_commit_lines} commit target); inspect `hunks` or `chunks` to split across commits via `--hunks` or `--lines`."
+                )
+            else:
+                size_warnings.append(
+                    f"File '{rel_path}' has {entry.effective_lines} effective lines "
+                    f"(> {eff_max_commit_lines} commit target); inspect `hunks {rel_path}` (or `chunks {rel_path}`) "
+                    f"and split top-level symbols + paired tests bottom-up via `--lines` unless mutually dependent."
+                )
+
     return {
         "repo_root": str(repo),
         "total_dirty_files": len(entries),
         "files": [asdict(entries[p]) for p in sorted(entries)],
         "topological_waves": waves,
         "mutual_dependency_cycles": cycles,
+        "size_summary": {
+            "effective_lines": total_effective,
+            "logic_lines": total_logic,
+            "test_lines": total_test,
+            "comment_lines": total_comment,
+            "blank_lines": total_blank,
+            "generated_lines": total_generated,
+            "raw_additions": total_raw_add,
+            "raw_deletions": total_raw_del,
+            "count_tests": eff_count_tests,
+            "count_comments": eff_count_comments,
+            "max_commit_lines": eff_max_commit_lines,
+            "max_pr_lines": eff_max_pr_lines,
+            "recommended_min_commits": recommended_min_commits,
+            "recommended_pr_count": recommended_pr_count,
+            "warnings": size_warnings,
+        },
+        "coverage_onboarding": detect_coverage_onboarding(repo),
     }
 
 

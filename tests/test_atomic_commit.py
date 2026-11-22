@@ -507,3 +507,76 @@ def test_get_file_hunks_and_diff_stats_full_blob(
     assert stats.logic_lines == expected_logic
     assert stats.comment_lines == expected_comment
 
+
+@pytest.mark.parametrize(
+    ("count_tests", "count_comments", "expected_effective_lines"),
+    [
+        pytest.param(False, False, 3, id="default_logic_only"),
+        pytest.param(True, False, 7, id="include_tests"),
+        pytest.param(False, True, 11, id="include_prod_comments"),
+        pytest.param(True, True, 17, id="include_tests_and_comments"),
+    ],
+)
+def test_line_counting_skips_comments_tests_blanks_and_generated_by_default(
+    temp_git_repo: Path,
+    count_tests: bool,
+    count_comments: bool,
+    expected_effective_lines: int,
+):
+    """Verifies line classification excludes tests, comments/docstrings, blanks, and lockfiles by default."""
+    files = {
+        "src/engine.py": (
+            '"""Engine module.\n'
+            "Doc line 2.\n"
+            '"""\n'
+            "\n"
+            "# compute tick\n"
+            "def tick(x: int) -> int:\n"
+            "    return x + 1\n"
+        ),
+        "client/view.ts": (
+            "/**\n"
+            " * Render view.\n"
+            " */\n"
+            "// single line\n"
+            "\n"
+            "export const view = 1;\n"
+        ),
+        "tests/test_engine.py": (
+            "# test helper comment\n"
+            "\n"
+            "def test_tick():\n"
+            "    assert True\n"
+        ),
+        "client/view.test.ts": (
+            "// test spec\n"
+            "it('ok', () => {\n"
+            "});\n"
+        ),
+        "uv.lock": "version = 1\n" * 5,
+    }
+    for rel_path, content in files.items():
+        p = temp_git_repo / rel_path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+
+    report = atomic_commit.inspect_status(
+        temp_git_repo,
+        count_tests=count_tests,
+        count_comments=count_comments,
+    )
+    ss = report["size_summary"]
+    assert ss["effective_lines"] == expected_effective_lines
+    assert ss["logic_lines"] == 3
+    assert ss["test_lines"] == 4
+    assert ss["comment_lines"] == 10
+    assert ss["blank_lines"] == 3
+    assert ss["generated_lines"] == 5
+
+    by_path = {f["path"]: f for f in report["files"]}
+    assert by_path["src/engine.py"]["file_role"] == "production"
+    assert by_path["tests/test_engine.py"]["file_role"] == "test"
+    assert by_path["client/view.test.ts"]["file_role"] == "test"
+    assert by_path["uv.lock"]["file_role"] == "generated"
+    assert by_path["uv.lock"]["effective_lines"] == 0
+
