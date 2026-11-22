@@ -109,6 +109,42 @@ def test_load_coverage_config(
     assert cfg.report_paths == expected_reports
 
 
+def test_coverage_cache_bounded_eviction_preserves_pinned_upstream(git_repo: Path, tmp_path: Path):
+    """Verifies CoverageCache stays bounded (<= 20 entries) while preserving pinned upstream merge-base entries."""
+    cache_file = tmp_path / "bounded-cov-cache.json"
+    cache = coverage_ratchet.CoverageCache(git_repo, cache_path_override=cache_file)
+    base_snap = coverage_ratchet.CoverageSnapshot(
+        total_lines=20, covered_lines=18, missed_lines=2, pct=90.0, files={}
+    )
+
+    cache.put(
+        "origin_tree_sha",
+        "fp1",
+        base_snap,
+        commit_sha="origin_sha",
+        label="origin/main",
+        pinned=True,
+    )
+    for idx in range(22):
+        cache.put(
+            f"rolling_tree_{idx}",
+            "fp1",
+            base_snap,
+            commit_sha=f"sha_{idx}",
+            label="HEAD",
+            pinned=False,
+        )
+
+    assert len(cache.entries) == 1 + coverage_ratchet.MAX_ROLLING_COV_ENTRIES
+    assert (
+        len(cache.entries)
+        <= coverage_ratchet.MAX_PINNED_COV_ENTRIES + coverage_ratchet.MAX_ROLLING_COV_ENTRIES
+    )
+
+    reloaded = coverage_ratchet.CoverageCache(git_repo, cache_path_override=cache_file)
+    assert reloaded.get("origin_tree_sha", "fp1") is not None
+    assert reloaded.get("rolling_tree_0", "fp1") is None
+    assert reloaded.get("rolling_tree_21", "fp1") is not None
 
 
 @pytest.mark.parametrize(
@@ -206,3 +242,48 @@ def test_detect_coverage_onboarding_across_stacks(
         else:
             assert expected_hint_substr in (onboarding["install_hint"] or "")
 
+
+@pytest.mark.parametrize(
+    ("current_stat", "expected_regressed", "expected_delta_missed", "expected_files"),
+    [
+        pytest.param(
+            coverage_ratchet.FileCoverageStat(12, 9, 3),
+            True,
+            1,
+            ["src/a.py"],
+            id="missed_lines_regressed",
+        ),
+        pytest.param(
+            coverage_ratchet.FileCoverageStat(6, 4, 2),
+            False,
+            0,
+            [],
+            id="dead_code_deleted_pct_drops_not_regressed",
+        ),
+    ],
+)
+def test_compare_coverage_snapshots(
+    current_stat: coverage_ratchet.FileCoverageStat,
+    expected_regressed: bool,
+    expected_delta_missed: int,
+    expected_files: list[str],
+):
+    """Verifies compare_coverage_snapshots tracks missed-line deltas rather than raw percentage drops."""
+    baseline = coverage_ratchet.CoverageSnapshot(
+        total_lines=10,
+        covered_lines=8,
+        missed_lines=2,
+        pct=80.0,
+        files={"src/a.py": coverage_ratchet.FileCoverageStat(10, 8, 2)},
+    )
+    current = coverage_ratchet.CoverageSnapshot(
+        total_lines=current_stat.total,
+        covered_lines=current_stat.covered,
+        missed_lines=current_stat.missed,
+        pct=round(100.0 * current_stat.covered / current_stat.total, 2),
+        files={"src/a.py": current_stat},
+    )
+    diff = coverage_ratchet.compare_coverage_snapshots(current, baseline, ["src/a.py"])
+    assert diff["regressed"] is expected_regressed
+    assert diff["delta_missed"] == expected_delta_missed
+    assert [f["path"] for f in diff["regressed_files"]] == expected_files

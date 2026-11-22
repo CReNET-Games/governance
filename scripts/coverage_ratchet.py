@@ -360,3 +360,179 @@ def detect_coverage_onboarding(
 
     return _unknown_stack_onboarding_payload()
 
+class CoverageCache:
+    """Bounded LRU cache for coverage snapshots with pinned remote/upstream branch anchors."""
+
+    def __init__(self, repo: Path, *, cache_path_override: Path | None = None) -> None:
+        self.repo = repo
+        self._override = cache_path_override
+        repo_hash = hashlib.sha256(str(repo.resolve()).encode("utf-8")).hexdigest()[:12]
+        self.primary_path = cache_path_override or (repo / ".git" / "crenet-coverage-cache.json")
+        self.fallback_path = (
+            cache_path_override
+            or Path(tempfile.gettempdir()) / f"crenet-coverage-cache-{repo_hash}.json"
+        )
+        self.seq = 0
+        self.entries: dict[str, dict[str, Any]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        candidates = [self.primary_path]
+        if self.fallback_path != self.primary_path:
+            candidates.append(self.fallback_path)
+        for p in candidates:
+            if not p.is_file():
+                continue
+            try:
+                raw = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(raw, dict):
+                continue
+            self.seq = max(self.seq, int(raw.get("seq", 0)))
+            raw_entries = raw.get("entries")
+            if isinstance(raw_entries, dict):
+                for k, v in raw_entries.items():
+                    if isinstance(v, dict) and (
+                        k not in self.entries
+                        or int(v.get("seq", 0)) > int(self.entries[k].get("seq", 0))
+                    ):
+                        self.entries[k] = v
+
+    def _evict(self) -> None:
+        pinned_keys = [k for k, v in self.entries.items() if v.get("pinned")]
+        rolling_keys = [k for k, v in self.entries.items() if not v.get("pinned")]
+
+        if len(pinned_keys) > MAX_PINNED_COV_ENTRIES:
+            pinned_keys.sort(key=lambda k: int(self.entries[k].get("seq", 0)))
+            for victim in pinned_keys[: len(pinned_keys) - MAX_PINNED_COV_ENTRIES]:
+                del self.entries[victim]
+
+        if len(rolling_keys) > MAX_ROLLING_COV_ENTRIES:
+            rolling_keys.sort(key=lambda k: int(self.entries[k].get("seq", 0)))
+            for victim in rolling_keys[: len(rolling_keys) - MAX_ROLLING_COV_ENTRIES]:
+                del self.entries[victim]
+
+    def _save(self) -> None:
+        self._evict()
+        payload = json.dumps({"version": 1, "seq": self.seq, "entries": self.entries}, indent=2)
+        for target in (self.primary_path, self.fallback_path):
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(payload, encoding="utf-8")
+                return
+            except OSError:
+                continue
+
+    @staticmethod
+    def _make_key(tree_sha: str, fingerprint: str) -> str:
+        return f"{tree_sha}:{fingerprint}"
+
+    def get(
+        self, tree_sha: str, fingerprint: str, *, pin: bool = False, label: str = ""
+    ) -> CoverageSnapshot | None:
+        key = self._make_key(tree_sha, fingerprint)
+        rec = self.entries.get(key)
+        if not isinstance(rec, dict) or not isinstance(rec.get("snapshot"), dict):
+            return None
+        self.seq += 1
+        rec["seq"] = self.seq
+        if pin and not rec.get("pinned"):
+            rec["pinned"] = True
+        if label:
+            rec["label"] = label
+        self._save()
+        return CoverageSnapshot.from_dict(rec["snapshot"])
+
+    def put(
+        self,
+        tree_sha: str,
+        fingerprint: str,
+        snapshot: CoverageSnapshot,
+        *,
+        commit_sha: str = "",
+        label: str = "",
+        pinned: bool = False,
+    ) -> None:
+        key = self._make_key(tree_sha, fingerprint)
+        prev = self.entries.get(key) or {}
+        self.seq += 1
+        self.entries[key] = {
+            "tree_sha": tree_sha,
+            "commit_sha": commit_sha or prev.get("commit_sha", ""),
+            "label": label or prev.get("label", ""),
+            "pinned": bool(pinned or prev.get("pinned", False)),
+            "seq": self.seq,
+            "snapshot": snapshot.to_dict(),
+        }
+        self._save()
+
+
+def resolve_upstream_anchor(repo: Path) -> tuple[str, str, str] | None:
+    """Resolve `(ref_label, merge_base_commit_sha, merge_base_tree_sha)` for remote tracking branch."""
+    if _git(["rev-parse", "--verify", "HEAD"], repo, check=False).returncode != 0:
+        return None
+
+    candidate_refs: list[str] = []
+    up_res = _git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], repo, check=False)
+    if up_res.returncode == 0 and up_res.stdout.strip():
+        candidate_refs.append(up_res.stdout.strip())
+    candidate_refs.extend(["origin/main", "origin/master", "origin/HEAD"])
+
+    seen: set[str] = set()
+    for ref in candidate_refs:
+        if ref in seen:
+            continue
+        seen.add(ref)
+        verify_res = _git(["rev-parse", "--verify", ref], repo, check=False)
+        if verify_res.returncode != 0:
+            continue
+        mb_res = _git(["merge-base", "HEAD", ref], repo, check=False)
+        if mb_res.returncode != 0 or not mb_res.stdout.strip():
+            continue
+        base_sha = mb_res.stdout.strip()
+        tree_res = _git(["rev-parse", f"{base_sha}^{{tree}}"], repo, check=False)
+        if tree_res.returncode == 0 and tree_res.stdout.strip():
+            return (ref, base_sha, tree_res.stdout.strip())
+    return None
+
+
+def compare_coverage_snapshots(
+    current: CoverageSnapshot,
+    baseline: CoverageSnapshot,
+    staged_prod_paths: Iterable[str],
+) -> dict[str, Any]:
+    """Compare `current` coverage against `baseline` using uncovered (`missed_lines`) deltas."""
+    delta_missed = current.missed_lines - baseline.missed_lines
+    delta_pct = round(current.pct - baseline.pct, 2)
+
+    regressed_files: list[dict[str, Any]] = []
+    for p in sorted(set(staged_prod_paths)):
+        cur_f = current.files.get(p)
+        if cur_f is None:
+            continue
+        base_f = baseline.files.get(p)
+        base_missed = base_f.missed if base_f is not None else 0
+        f_delta = cur_f.missed - base_missed
+        if f_delta > 0:
+            regressed_files.append(
+                {
+                    "path": p,
+                    "baseline_missed": base_missed,
+                    "current_missed": cur_f.missed,
+                    "delta_missed": f_delta,
+                }
+            )
+
+    regressed = delta_missed > 0
+    return {
+        "baseline_missed": baseline.missed_lines,
+        "current_missed": current.missed_lines,
+        "delta_missed": delta_missed,
+        "baseline_pct": baseline.pct,
+        "current_pct": current.pct,
+        "delta_pct": delta_pct,
+        "regressed": regressed,
+        "regressed_files": regressed_files,
+    }
+
