@@ -5,3 +5,9 @@ __pycache__
 .env.local
 .env.*.local
 TODO.md
+.coverage
+.coverage.*
+coverage.json
+coverage.xml
+lcov.info
+coverage/
