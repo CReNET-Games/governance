@@ -857,3 +857,35 @@ def test_verify_coverage_ratchet_cold_start_warn_error_and_dead_code_deletion(
         assert res["warnings"] == []
 
 
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_attrs"),
+    [
+        pytest.param(
+            ["status", "--include-tests", "--include-comments", "--max-commit-lines", "50", "--max-pr-lines", "120"],
+            {"subcommand": "status", "include_tests": True, "include_comments": True, "max_commit_lines": 50, "max_pr_lines": 120},
+            id="status_sizing_flags",
+        ),
+        pytest.param(
+            ["chunks", "app.py", "--max-chunk-lines", "80", "--json"],
+            {"subcommand": "chunks", "file": "app.py", "max_chunk_lines": 80, "json": True},
+            id="chunks_subcommand",
+        ),
+        pytest.param(
+            ["stage", "--lines", "a.py:1-5", "--lines", "b.py:2-4"],
+            {"subcommand": "stage", "lines": ["a.py:1-5", "b.py:2-4"]},
+            id="stage_repeated_lines",
+        ),
+        pytest.param(
+            ["verify", "--coverage-cmd", "pytest", "--coverage-report", "cov.json", "--coverage-mode", "error"],
+            {"subcommand": "verify", "coverage_cmd": "pytest", "coverage_report": ["cov.json"], "coverage_mode": "error"},
+            id="verify_coverage_flags",
+        ),
+    ],
+)
+def test_build_parser_new_flags_and_chunks(argv: list[str], expected_attrs: dict):
+    """Verifies build_parser registers chunks subcommand and sizing/lines/coverage flags."""
+    ns = atomic_commit.build_parser().parse_args(argv)
+    for key, val in expected_attrs.items():
+        assert getattr(ns, key) == val

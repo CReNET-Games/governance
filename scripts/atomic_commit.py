@@ -1459,7 +1459,31 @@ def build_parser() -> argparse.ArgumentParser:
     # status
     p_status = sub.add_parser(
         "status",
-        help="Inspect dirty/untracked files, hunk counts, and static dependency commit waves.",
+        help="Inspect dirty/untracked files, hunk counts, line budgets, and static dependency commit waves.",
+    )
+    p_status.add_argument(
+        "--include-tests",
+        action="store_true",
+        default=None,
+        help="Include test files in effective_lines commit/PR size budgets.",
+    )
+    p_status.add_argument(
+        "--include-comments",
+        action="store_true",
+        default=None,
+        help="Include comment/docstring lines in effective_lines commit/PR size budgets.",
+    )
+    p_status.add_argument(
+        "--max-commit-lines",
+        type=int,
+        default=None,
+        help=f"Soft commit size target in effective lines (default: config or {DEFAULT_MAX_COMMIT_LOGIC_LINES}).",
+    )
+    p_status.add_argument(
+        "--max-pr-lines",
+        type=int,
+        default=None,
+        help=f"Soft single-PR size target in effective lines (default: config or {DEFAULT_MAX_PR_LOGIC_LINES}).",
     )
     p_status.add_argument("--json", action="store_true", help="Output JSON report.")
 
@@ -1476,10 +1500,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_hunks.add_argument("--json", action="store_true", help="Output JSON report.")
 
+    # chunks
+    p_chunks = sub.add_parser(
+        "chunks",
+        help="Analyze top-level symbol chunks and suggested `--lines` slices for new or large files.",
+    )
+    p_chunks.add_argument("file", help="Repository-relative path to the file.")
+    p_chunks.add_argument(
+        "--max-chunk-lines",
+        type=int,
+        default=None,
+        help="Target maximum logic/test lines per suggested slice (default: config or 200).",
+    )
+    p_chunks.add_argument("--json", action="store_true", help="Output JSON report.")
+
     # stage
     p_stage = sub.add_parser(
         "stage",
-        help="Stage full files and/or specific numbered hunks into the Git index.",
+        help="Stage full files, numbered hunks, and/or 1-based line ranges into the Git index.",
     )
     p_stage.add_argument(
         "--reset",
@@ -1488,16 +1526,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_stage.add_argument(
         "--files",
-        nargs="*",
+        action="extend",
+        nargs="+",
         default=[],
         help="Full files (modified, untracked, or deleted) to stage with `git add`.",
     )
     p_stage.add_argument(
         "--hunks",
-        nargs="*",
+        action="extend",
+        nargs="+",
         default=[],
         metavar="FILE:1,2",
         help="Partial file hunks to stage in the format `path/to/file:1,3`.",
+    )
+    p_stage.add_argument(
+        "--lines",
+        action="extend",
+        nargs="+",
+        default=[],
+        metavar="FILE:START-END,...",
+        help="Partial 1-based working-tree line ranges to stage directly into the Git index (works on untracked files too).",
     )
 
     # verify
@@ -1522,9 +1570,81 @@ def build_parser() -> argparse.ArgumentParser:
         default=120,
         help="Per-command timeout in seconds inside the isolated worktree (default: 120).",
     )
+    p_verify.add_argument(
+        "--include-tests",
+        action="store_true",
+        default=None,
+        help="Include test files in effective_lines commit size check.",
+    )
+    p_verify.add_argument(
+        "--include-comments",
+        action="store_true",
+        default=None,
+        help="Include comment/docstring lines in effective_lines commit size check.",
+    )
+    p_verify.add_argument(
+        "--max-commit-lines",
+        type=int,
+        default=None,
+        help=f"Soft commit size warning threshold in effective lines (default: config or {DEFAULT_MAX_COMMIT_LOGIC_LINES}).",
+    )
+    p_verify.add_argument(
+        "--max-commit-files",
+        type=int,
+        default=None,
+        help=f"Soft commit scope warning threshold in production files (default: config or {DEFAULT_MAX_COMMIT_FILES}).",
+    )
+    p_verify.add_argument(
+        "--coverage-cmd",
+        default=None,
+        help="Optional shell command to generate a coverage report inside the isolated worktree.",
+    )
+    p_verify.add_argument(
+        "--coverage-report",
+        action="append",
+        default=[],
+        help="Worktree-relative coverage report path (Istanbul JSON, coverage.json, lcov.info, or coverage.xml).",
+    )
+    p_verify.add_argument(
+        "--coverage-mode",
+        choices=["warn", "error", "off"],
+        default=None,
+        help="Override coverage enforcement mode ('warn', 'error', or 'off').",
+    )
     p_verify.add_argument("--json", action="store_true", help="Output JSON report.")
 
     return parser
+
+
+def _print_chunk_analysis(chunk_analysis: dict[str, Any], *, include_header: bool = True) -> None:
+    if include_header:
+        print(
+            f"File: {chunk_analysis['file']} ({chunk_analysis['chunk_count']} chunks, role={chunk_analysis['file_role']})"
+        )
+    else:
+        print(
+            f"\nSymbol Chunks ({chunk_analysis['chunk_count']} chunks, role={chunk_analysis['file_role']}):"
+        )
+    for ch in chunk_analysis["chunks"]:
+        syms = ", ".join(ch["symbols"]) or "(block)"
+        deps = (
+            f" -> depends on: {', '.join(ch['depends_on_symbols'])}"
+            if ch["depends_on_symbols"]
+            else ""
+        )
+        print(
+            f"  [{ch['index']:2d}|{ch['kind']}|{ch['status']}] L{ch['start_line']}-{ch['end_line']} "
+            f"{syms} (logic={ch['logic_lines']}, test={ch['test_lines']}){deps}"
+        )
+    if chunk_analysis["suggested_line_slices"]:
+        print("\nSuggested `--lines` Slices:")
+        for sl in chunk_analysis["suggested_line_slices"]:
+            metric_val = sl.get("logic_lines", sl.get("test_lines", 0))
+            metric_lbl = "logic" if "logic_lines" in sl else "test"
+            print(
+                f"  Slice {sl['slice_index']} ({metric_lbl}={metric_val}, chunks={sl['chunk_indices']}): "
+                f"--lines {sl['line_spec']}"
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1533,7 +1653,13 @@ def main(argv: list[str] | None = None) -> int:
     repo = get_repo_root(Path(args.repo))
 
     if args.subcommand == "status":
-        report = inspect_status(repo)
+        report = inspect_status(
+            repo,
+            count_tests=args.include_tests,
+            count_comments=args.include_comments,
+            max_commit_lines=args.max_commit_lines,
+            max_pr_lines=args.max_pr_lines,
+        )
         if args.json:
             print(json.dumps(report, indent=2))
         else:
