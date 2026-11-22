@@ -100,3 +100,66 @@ def test_classify_file_role_with_custom_sizing_config(rel_path: str, expected_ro
         test_globs=("**/fixtures/**", "**/*.bench.ts"),
     )
     assert commit_sizing.classify_file_role(rel_path, config=cfg) == expected_role
+
+
+def test_load_sizing_config_worktree_staged_invalid_and_cli_overrides(tmp_path: Path):
+    """Verifies load_sizing_config parses JSON, prefers staged index, handles bad JSON, and honors CLI overrides."""
+    repo = tmp_path / "sizing_cfg_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "dev@crenet.games"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test Dev"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=repo, check=True)
+
+    # 1. Missing config returns defaults
+    default_cfg = commit_sizing.load_sizing_config(repo)
+    assert default_cfg.max_commit_lines == 200
+    assert default_cfg.generated_globs == ()
+
+    # 2. Corrupt JSON falls back cleanly to defaults
+    cfg_path = repo / ".crenet-governance.json"
+    cfg_path.write_text("{not valid json", encoding="utf-8")
+    assert commit_sizing.load_sizing_config(repo).max_commit_lines == 200
+
+    # 3. Valid worktree config + type guards + extension normalization (`g.dart` -> `.g.dart`)
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "sizing": {
+                    "max_commit_lines": 120,
+                    "max_commit_files": "bad",
+                    "max_pr_lines": True,
+                    "count_tests": True,
+                    "count_comments": "bad",
+                    "generated_basenames": ["schema.graphql", " "],
+                    "generated_extensions": [".pb.ts", "g.dart", ""],
+                    "generated_globs": ["src/generated/**", "**/*.gen.ts"],
+                    "test_globs": "not-a-list",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    wt_cfg = commit_sizing.load_sizing_config(repo)
+    assert wt_cfg.max_commit_lines == 120
+    assert wt_cfg.max_commit_files == commit_sizing.DEFAULT_MAX_COMMIT_FILES
+    assert wt_cfg.max_pr_lines == commit_sizing.DEFAULT_MAX_PR_LOGIC_LINES
+    assert wt_cfg.count_tests is True
+    assert wt_cfg.count_comments is False
+    assert wt_cfg.generated_basenames == frozenset({"schema.graphql"})
+    assert wt_cfg.generated_extensions == frozenset({".pb.ts", ".g.dart"})
+    assert wt_cfg.generated_globs == ("src/generated/**", "**/*.gen.ts")
+    assert wt_cfg.test_globs == ()
+
+    # 4. Staged index config takes precedence over modified worktree config
+    subprocess.run(["git", "add", ".crenet-governance.json"], cwd=repo, check=True)
+    cfg_path.write_text(json.dumps({"sizing": {"max_commit_lines": 999}}), encoding="utf-8")
+    staged_cfg = commit_sizing.load_sizing_config(
+        repo,
+        staged={".crenet-governance.json": "A"},
+        max_commit_lines=75,
+        count_comments=True,
+    )
+    assert staged_cfg.max_commit_lines == 75
+    assert staged_cfg.count_tests is True
+    assert staged_cfg.count_comments is True
