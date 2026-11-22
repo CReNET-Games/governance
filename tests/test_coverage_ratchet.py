@@ -385,3 +385,48 @@ def test_collect_staged_worktree_coverage_and_evaluate_baseline_ratchet(git_repo
     assert vs_head is not None and vs_head["delta_missed"] == 1
     assert vs_up is not None and vs_up["anchor_ref"] == "origin/main"
     assert r_errs == [] and any("src/a.py (+1 missed)" in w for w in r_warns)
+
+
+@pytest.mark.parametrize(
+    ("cov_state", "skip_worktree", "expected_status", "expected_warn_substr"),
+    [
+        pytest.param("opted_out", True, "opted_out", None, id="opted_out_no_warning"),
+        pytest.param("unconfigured", True, "skipped", "Test pairing warning", id="unconfigured_pairing_warn"),
+        pytest.param("unconfigured", False, "unconfigured", "Coverage is not configured", id="worktree_onboarding_warn"),
+    ],
+)
+def test_run_worktree_and_coverage_checks_states(
+    git_repo: Path,
+    tmp_path: Path,
+    cov_state: str,
+    skip_worktree: bool,
+    expected_status: str,
+    expected_warn_substr: str | None,
+):
+    """Verifies run_worktree_and_coverage_checks status transitions and pairing/onboarding warnings."""
+    onboarding = (
+        {"detected_stack": "pytest", "message": "Coverage is not configured in `.crenet-governance.json`."}
+        if cov_state == "unconfigured"
+        else None
+    )
+    res = coverage_ratchet.run_worktree_and_coverage_checks(
+        git_repo,
+        commands=[],
+        cov_cfg=coverage_ratchet.CoverageConfig(state=cov_state),
+        onboarding=onboarding,
+        staged_prod_paths=["src/a.py"],
+        exec_code_logic_lines=5,
+        exec_code_files=["src/a.py"],
+        test_files=0,
+        head_exists=True,
+        has_static_errors=False,
+        skip_worktree=skip_worktree,
+        command_timeout=30,
+        cache_path_override=tmp_path / "run-cache.json",
+    )
+    assert res["errors"] == []
+    assert res["coverage"]["status"] == expected_status
+    if expected_warn_substr is None:
+        assert res["warnings"] == []
+    else:
+        assert any(expected_warn_substr in w for w in res["warnings"])

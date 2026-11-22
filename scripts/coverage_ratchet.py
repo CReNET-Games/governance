@@ -360,6 +360,7 @@ def detect_coverage_onboarding(
 
     return _unknown_stack_onboarding_payload()
 
+
 class CoverageCache:
     """Bounded LRU cache for coverage snapshots with pinned remote/upstream branch anchors."""
 
@@ -856,3 +857,135 @@ def _evaluate_baseline_ratchet(
         )
 
     return vs_head, vs_upstream, new_status, errors, warnings
+
+
+def run_worktree_and_coverage_checks(
+    repo: Path,
+    *,
+    commands: list[str],
+    cov_cfg: CoverageConfig,
+    onboarding: dict[str, Any] | None,
+    staged_prod_paths: list[str],
+    exec_code_logic_lines: int,
+    exec_code_files: list[str],
+    test_files: int,
+    head_exists: bool,
+    has_static_errors: bool,
+    skip_worktree: bool,
+    command_timeout: int,
+    cache_path_override: Path | None = None,
+) -> dict[str, Any]:
+    """Execute Check 3 (isolated worktree commands, coverage ratchet, and test-pairing fallback)."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    command_results: list[dict[str, Any]] = []
+    staged_snap: CoverageSnapshot | None = None
+    cov_status = (
+        "opted_out"
+        if cov_cfg.state == "opted_out"
+        else ("skipped" if skip_worktree else cov_cfg.state)
+    )
+    cov_cache: CoverageCache | None = None
+
+    need_cov_worktree = cov_cfg.state == "configured" and bool(
+        cov_cfg.command or cov_cfg.report_paths
+    )
+    run_worktree = not has_static_errors and not skip_worktree and (bool(commands) or need_cov_worktree)
+
+    if run_worktree:
+        tree_sha = _git(["write-tree"], repo).stdout.strip()
+        commit_cmd = ["commit-tree", tree_sha, "-m", "atomic-commit-verify-slice"]
+        if head_exists:
+            commit_cmd[2:2] = ["-p", "HEAD"]
+        commit_sha = _git(commit_cmd, repo).stdout.strip()
+
+        if cov_cfg.state == "configured":
+            cov_cache = CoverageCache(repo, cache_path_override=cache_path_override)
+            if not commands:
+                staged_snap = cov_cache.get(tree_sha, cov_cfg.fingerprint, label="staged")
+                if staged_snap is not None:
+                    cov_status = "cached"
+
+        if commands or (need_cov_worktree and staged_snap is None):
+            with _ephemeral_worktree(repo, commit_sha) as (tmp_dir, wt_env):
+                if commands:
+                    cmd_res, cmd_errs = _execute_worktree_commands(
+                        commands, tmp_dir, wt_env, command_timeout
+                    )
+                    command_results.extend(cmd_res)
+                    errors.extend(cmd_errs)
+
+                if not errors:
+                    if cov_cfg.state == "configured" and cov_cache is not None:
+                        staged_snap, cov_status, c_errs, c_warns = _collect_staged_worktree_coverage(
+                            tmp_dir,
+                            wt_env,
+                            tree_sha,
+                            commit_sha,
+                            cov_cfg,
+                            cov_cache,
+                            commands,
+                            command_results,
+                            command_timeout,
+                        )
+                        errors.extend(c_errs)
+                        warnings.extend(c_warns)
+                    elif cov_cfg.state == "unconfigured" and commands:
+                        try:
+                            staged_snap = collect_worktree_coverage(tmp_dir, [])
+                            if staged_snap is not None:
+                                cov_status = "evaluated"
+                        except (OSError, ValueError, ET.ParseError):
+                            staged_snap = None
+
+    vs_head: dict[str, Any] | None = None
+    vs_upstream: dict[str, Any] | None = None
+    if (
+        not has_static_errors
+        and not errors
+        and staged_snap is not None
+        and head_exists
+        and cov_cfg.state == "configured"
+    ):
+        if cov_cache is None:
+            cov_cache = CoverageCache(repo, cache_path_override=cache_path_override)
+        vs_head, vs_upstream, reg_status, r_errs, r_warns = _evaluate_baseline_ratchet(
+            repo,
+            staged_snap,
+            staged_prod_paths,
+            cov_cfg,
+            cov_cache,
+            command_timeout,
+        )
+        if reg_status is not None:
+            cov_status = reg_status
+        errors.extend(r_errs)
+        warnings.extend(r_warns)
+
+    if not has_static_errors and not errors and staged_snap is None and cov_cfg.state != "opted_out":
+        if exec_code_logic_lines > 0 and test_files == 0:
+            sample_files = ", ".join(exec_code_files[:3])
+            if len(exec_code_files) > 3:
+                sample_files += f", +{len(exec_code_files) - 3} more"
+            warnings.append(
+                f"Test pairing warning: staged slice modifies {exec_code_logic_lines} executable logic line(s) "
+                f"({sample_files}) with 0 staged test files. Pair matching unit tests in this commit "
+                f"(excluded from effective_lines), or configure/opt out of coverage in .crenet-governance.json."
+            )
+        if onboarding is not None and not skip_worktree:
+            warnings.append(onboarding["message"])
+
+    return {
+        "command_results": command_results,
+        "errors": errors,
+        "warnings": warnings,
+        "coverage": {
+            "status": cov_status,
+            "state": cov_cfg.state,
+            "mode": cov_cfg.mode,
+            "snapshot": staged_snap.to_dict(max_files=0) if staged_snap is not None else None,
+            "vs_head": vs_head,
+            "vs_upstream": vs_upstream,
+            "onboarding": onboarding,
+        },
+    }
