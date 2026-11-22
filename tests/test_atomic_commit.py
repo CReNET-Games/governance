@@ -613,3 +613,247 @@ def test_compute_staged_slice_metrics(
     else:
         assert any(expected_warn_substr in w for w in warns)
 
+
+@pytest.mark.parametrize(
+    ("count_comments", "expected_effective_lines"),
+    [
+        pytest.param(False, 0, id="exclude_comments_default"),
+        pytest.param(True, 4, id="include_comments_override"),
+    ],
+)
+def test_mid_docstring_edit_classified_as_comment_via_full_blob(
+    temp_git_repo: Path,
+    count_comments: bool,
+    expected_effective_lines: int,
+):
+    """Verifies edits deep inside a multi-line docstring/block comment are classified as comments, not logic."""
+    py_path = temp_git_repo / "documented.py"
+    lines = [
+        "def documented():\n",
+        '    """Start of a long docstring.\n',
+        *[f"    Doc line {i}.\n" for i in range(1, 14)],
+        '    """\n',
+        "    return 42\n",
+    ]
+    py_path.write_text("".join(lines), encoding="utf-8")
+    subprocess.run(["git", "add", "documented.py"], cwd=temp_git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "docs: add documented.py"],
+        cwd=temp_git_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    lines[8] = "    Updated middle documentation line 7.\n"
+    lines[9] = "    Updated middle documentation line 8.\n"
+    py_path.write_text("".join(lines), encoding="utf-8")
+
+    status_report = atomic_commit.inspect_status(temp_git_repo, count_comments=count_comments)
+    fentry = status_report["files"][0]
+    assert fentry["logic_lines"] == 0
+    assert fentry["comment_lines"] == 4
+    assert fentry["effective_lines"] == expected_effective_lines
+
+    _, hunk_dicts = atomic_commit.get_file_hunks_with_stats(temp_git_repo, "documented.py")
+    assert len(hunk_dicts) == 1
+    assert hunk_dicts[0]["logic_lines"] == 0
+    assert hunk_dicts[0]["comment_lines"] == 4
+
+    atomic_commit.main(["--repo", str(temp_git_repo), "stage", "--reset", "--files", "documented.py"])
+    res = atomic_commit.verify_staged_slice(
+        temp_git_repo, skip_worktree=True, count_comments=count_comments
+    )
+    assert res["passed"] is True
+    assert res["size_metrics"]["logic_lines"] == 0
+    assert res["size_metrics"]["comment_lines"] == 4
+    assert res["size_metrics"]["effective_lines"] == expected_effective_lines
+
+
+
+@pytest.mark.parametrize(
+    ("extra_files", "staged_files", "skip_worktree", "expected_cov_status", "expected_warn_substr"),
+    [
+        pytest.param({}, ["docs/notes.md"], True, "skipped", None, id="docs_only"),
+        pytest.param(
+            {}, ["src/logic.py"], True, "skipped", "Test pairing warning", id="untested_executable_warns"
+        ),
+        pytest.param(
+            {".crenet-governance.json": '{"coverage": false}\n'},
+            ["src/logic.py", ".crenet-governance.json"],
+            False,
+            "opted_out",
+            None,
+            id="governance_opt_out",
+        ),
+    ],
+)
+def test_test_pairing_warning_and_opt_out(
+    temp_git_repo: Path,
+    extra_files: dict[str, str],
+    staged_files: list[str],
+    skip_worktree: bool,
+    expected_cov_status: str,
+    expected_warn_substr: str | None,
+):
+    """Verifies Test pairing warning fires on untested executable slices, skips docs, and respects opt-out."""
+    (temp_git_repo / "src").mkdir()
+    (temp_git_repo / "src/logic.py").write_text("def compute(x):\n    return x * 2\n", encoding="utf-8")
+    (temp_git_repo / "docs").mkdir()
+    (temp_git_repo / "docs/notes.md").write_text("# Architecture\n\nDetails.\n", encoding="utf-8")
+    for rel_path, content in extra_files.items():
+        (temp_git_repo / rel_path).write_text(content, encoding="utf-8")
+
+    atomic_commit.main(["--repo", str(temp_git_repo), "stage", "--reset", "--files", *staged_files])
+    res = atomic_commit.verify_staged_slice(temp_git_repo, skip_worktree=skip_worktree)
+    assert res["passed"] is True
+    assert res["coverage"]["status"] == expected_cov_status
+    if expected_warn_substr is None:
+        assert res["warnings"] == []
+    else:
+        assert any(expected_warn_substr in w for w in res["warnings"])
+
+
+def _setup_calc_ratchet_repo(repo: Path) -> None:
+    import json as _json
+
+    (repo / "src").mkdir()
+    (repo / "src/calc.py").write_text(
+        "def add(a, b):\n"
+        "    return a + b\n"
+        "\n"
+        "def dead_covered_a():\n"
+        "    x = 1\n"
+        "    return x\n"
+        "\n"
+        "def legacy_untested():\n"
+        "    return 99\n",
+        encoding="utf-8",
+    )
+    (repo / "tests").mkdir()
+    (repo / "tests/test_calc.py").write_text(
+        "from src.calc import add, dead_covered_a\n"
+        "def test_add():\n"
+        "    assert add(2, 3) == 5\n"
+        "    assert dead_covered_a() == 1\n",
+        encoding="utf-8",
+    )
+    cov_cfg_payload = {
+        "coverage": {
+            "command": (
+                f"{sys.executable} -m coverage run --source=src -m pytest -q "
+                f"&& {sys.executable} -m coverage json -o coverage.json"
+            ),
+            "report_path": "coverage.json",
+            "mode": "warn",
+        }
+    }
+    (repo / ".crenet-governance.json").write_text(
+        _json.dumps(cov_cfg_payload, indent=2) + "\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "feat: add calc with coverage config"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    head_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", head_sha],
+        cwd=repo,
+        check=True,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "calc_src",
+        "test_src",
+        "staged_files",
+        "coverage_mode",
+        "expected_passed",
+        "expected_status",
+        "expected_delta_missed",
+    ),
+    [
+        pytest.param(
+            (
+                "def add(a, b):\n    return a + b\n\n"
+                "def dead_covered_a():\n    x = 1\n    return x\n\n"
+                "def legacy_untested():\n    return 99\n\n"
+                "def brand_new_untested(z):\n    y = z + 1\n    return y\n"
+            ),
+            None,
+            ["src/calc.py"],
+            None,
+            True,
+            "regressed",
+            2,
+            id="untested_addition_warn",
+        ),
+        pytest.param(
+            (
+                "def add(a, b):\n    return a + b\n\n"
+                "def dead_covered_a():\n    x = 1\n    return x\n\n"
+                "def legacy_untested():\n    return 99\n\n"
+                "def brand_new_untested(z):\n    y = z + 1\n    return y\n"
+            ),
+            None,
+            ["src/calc.py"],
+            "error",
+            False,
+            "regressed",
+            2,
+            id="untested_addition_error",
+        ),
+        pytest.param(
+            "def add(a, b):\n    return a + b\n\n" "def legacy_untested():\n    return 99\n",
+            "from src.calc import add\ndef test_add():\n    assert add(2, 3) == 5\n",
+            ["src/calc.py", "tests/test_calc.py"],
+            "error",
+            True,
+            "evaluated",
+            0,
+            id="dead_covered_deletion_no_false_positive",
+        ),
+    ],
+)
+def test_verify_coverage_ratchet_cold_start_warn_error_and_dead_code_deletion(
+    temp_git_repo: Path,
+    tmp_path: Path,
+    calc_src: str,
+    test_src: str | None,
+    staged_files: list[str],
+    coverage_mode: str | None,
+    expected_passed: bool,
+    expected_status: str,
+    expected_delta_missed: int,
+):
+    """Verifies cold-start HEAD/origin baseline capture, warn vs error mode, and zero false positive on dead-code deletion."""
+    _setup_calc_ratchet_repo(temp_git_repo)
+    (temp_git_repo / "src/calc.py").write_text(calc_src, encoding="utf-8")
+    if test_src is not None:
+        (temp_git_repo / "tests/test_calc.py").write_text(test_src, encoding="utf-8")
+
+    atomic_commit.main(["--repo", str(temp_git_repo), "stage", "--reset", "--files", *staged_files])
+    res = atomic_commit.verify_staged_slice(
+        temp_git_repo,
+        coverage_mode=coverage_mode,
+        cache_path_override=tmp_path / "ratchet-cache.json",
+    )
+    assert res["passed"] is expected_passed
+    assert res["coverage"]["status"] == expected_status
+    assert res["coverage"]["vs_head"]["delta_missed"] == expected_delta_missed
+    assert res["coverage"]["vs_upstream"]["anchor_ref"] == "origin/main"
+    if not expected_passed:
+        assert any("Coverage regression (error)" in e for e in res["errors"])
+    elif expected_delta_missed > 0:
+        assert any("Coverage regression (warn)" in w and "src/calc.py (+2 missed)" in w for w in res["warnings"])
+    else:
+        assert res["coverage"]["vs_head"]["delta_pct"] < 0
+        assert res["coverage"]["vs_head"]["regressed"] is False
+        assert res["warnings"] == []
+
+

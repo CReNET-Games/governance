@@ -19,11 +19,10 @@ import math
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
-from typing import Iterable
+from typing import Any
+
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
@@ -1229,27 +1228,87 @@ def _compute_staged_slice_metrics(
 
     return size_metrics, warnings, staged_prod_paths, exec_code_logic_lines, exec_code_files
 
+
 def verify_staged_slice(
     repo: Path,
     commands: list[str] | None = None,
     *,
     skip_worktree: bool = False,
     command_timeout: int = 120,
+    max_commit_lines: int | None = None,
+    max_commit_files: int | None = None,
+    count_tests: bool | None = None,
+    count_comments: bool | None = None,
+    coverage_cmd: str | None = None,
+    coverage_reports: list[str] | None = None,
+    coverage_mode: str | None = None,
+    cache_path_override: Path | None = None,
 ) -> dict:
     """Deterministically verify that the staged slice (`HEAD + index`) is valid and self-contained."""
     import ledger as asset_ledger
 
     staged = get_staged_files(repo)
+    sizing_cfg = load_sizing_config(
+        repo,
+        staged or None,
+        max_commit_lines=max_commit_lines,
+        max_commit_files=max_commit_files,
+        count_tests=count_tests,
+        count_comments=count_comments,
+    )
+
     if not staged:
         return {
             "passed": False,
             "staged_files": [],
             "errors": ["No files are currently staged in the Git index."],
+            "warnings": [],
+            "size_metrics": _build_size_metrics_dict(
+                LineStats(),
+                effective_lines=0,
+                production_files=0,
+                test_files=0,
+                generated_files=0,
+                count_tests=sizing_cfg.count_tests,
+                count_comments=sizing_cfg.count_comments,
+                max_commit_lines=sizing_cfg.max_commit_lines,
+                max_commit_files=sizing_cfg.max_commit_files,
+            ),
+            "coverage": {
+                "status": "skipped",
+                "state": "empty_index",
+                "mode": coverage_mode or "warn",
+                "snapshot": None,
+                "vs_head": None,
+                "vs_upstream": None,
+                "onboarding": None,
+            },
             "command_results": [],
         }
 
     errors: list[str] = []
     known_files = get_all_repo_files(repo)
+    head_exists = has_head_commit(repo)
+    (
+        size_metrics,
+        warnings,
+        staged_prod_paths,
+        exec_code_logic_lines,
+        exec_code_files,
+    ) = _compute_staged_slice_metrics(repo, staged, sizing_cfg, head_exists=head_exists)
+
+    cov_cfg = load_coverage_config(
+        repo,
+        staged,
+        cli_cmd=coverage_cmd,
+        cli_reports=coverage_reports,
+        cli_mode=coverage_mode,
+    )
+    onboarding = (
+        detect_coverage_onboarding(repo, staged)
+        if cov_cfg.state == "unconfigured"
+        else None
+    )
 
     effective_ledger = None
     ledger_error: str | None = None
@@ -1303,6 +1362,11 @@ def verify_staged_slice(
         if CONFLICT_MARKER_RE.search(staged_content):
             errors.append(f"Staged file '{rel_path}' contains leftover merge conflict markers.")
 
+        # Verify intra-file syntax and top-level symbol references when partially staged
+        if rel_path in unstaged_modified:
+            wt_self_content = _read_text_safe(repo / rel_path)
+            errors.extend(check_staged_intrafile_refs(rel_path, staged_content, wt_self_content))
+
         # Check imports against unstaged/untracked files and partially staged exports
         imports = extract_file_imports(rel_path, staged_content, known_files, repo=repo)
         for target_path, imp_info in imports.items():
@@ -1334,80 +1398,32 @@ def verify_staged_slice(
                                 f"which only exists in unstaged working-tree changes of '{target_path}'."
                             )
 
-    command_results: list[dict] = []
-
-    # Check 3: Ephemeral `git write-tree` + detached worktree execution
-    if not errors and commands and not skip_worktree:
-        tree_sha = run_git(["write-tree"], repo).stdout.strip()
-        commit_cmd = ["commit-tree", tree_sha, "-m", "atomic-commit-verify-slice"]
-        if has_head_commit(repo):
-            commit_cmd[2:2] = ["-p", "HEAD"]
-        commit_sha = run_git(commit_cmd, repo).stdout.strip()
-
-        tmp_dir = Path(tempfile.mkdtemp(prefix="atomic-verify-"))
-        try:
-            run_git(["worktree", "add", "--detach", str(tmp_dir), commit_sha], repo)
-
-            # Symlink dependency caches (root + subpackage node_modules, .venv) into ephemeral worktree
-            for cache_dir in ("node_modules", ".venv"):
-                src_cache = repo / cache_dir
-                dst_cache = tmp_dir / cache_dir
-                if src_cache.exists() and not dst_cache.exists():
-                    os.symlink(str(src_cache), str(dst_cache))
-            for child in repo.iterdir():
-                if child.is_dir() and not child.name.startswith("."):
-                    sub_nm = child / "node_modules"
-                    dst_sub = tmp_dir / child.name / "node_modules"
-                    if sub_nm.exists() and (tmp_dir / child.name).is_dir() and not dst_sub.exists():
-                        os.symlink(str(sub_nm), str(dst_sub))
-
-            for cmd_str in commands:
-                try:
-                    proc = subprocess.run(
-                        cmd_str,
-                        cwd=str(tmp_dir),
-                        shell=True,
-                        text=True,
-                        capture_output=True,
-                        timeout=command_timeout,
-                    )
-                    command_results.append(
-                        {
-                            "command": cmd_str,
-                            "returncode": proc.returncode,
-                            "stdout": proc.stdout,
-                            "stderr": proc.stderr,
-                        }
-                    )
-                    if proc.returncode != 0:
-                        errors.append(
-                            f"Verification command failed (exit {proc.returncode}) in isolated staged worktree: {cmd_str}"
-                        )
-                        break
-                except subprocess.TimeoutExpired as exc:
-                    command_results.append(
-                        {
-                            "command": cmd_str,
-                            "returncode": 124,
-                            "stdout": exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or ""),
-                            "stderr": f"Command timed out after {command_timeout}s",
-                        }
-                    )
-                    errors.append(
-                        f"Verification command timed out after {command_timeout}s in isolated staged worktree: {cmd_str}"
-                    )
-                    break
-        finally:
-            run_git(["worktree", "remove", "--force", str(tmp_dir)], repo, check=False)
-            if tmp_dir.exists():
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            run_git(["worktree", "prune"], repo, check=False)
+    worktree_result = run_worktree_and_coverage_checks(
+        repo,
+        commands=commands or [],
+        cov_cfg=cov_cfg,
+        onboarding=onboarding,
+        staged_prod_paths=staged_prod_paths,
+        exec_code_logic_lines=exec_code_logic_lines,
+        exec_code_files=exec_code_files,
+        test_files=size_metrics["test_files"],
+        head_exists=head_exists,
+        has_static_errors=bool(errors),
+        skip_worktree=skip_worktree,
+        command_timeout=command_timeout,
+        cache_path_override=cache_path_override,
+    )
+    errors.extend(worktree_result["errors"])
+    warnings.extend(worktree_result["warnings"])
 
     return {
         "passed": len(errors) == 0,
         "staged_files": sorted(staged.keys()),
         "errors": errors,
-        "command_results": command_results,
+        "warnings": warnings,
+        "size_metrics": size_metrics,
+        "coverage": worktree_result["coverage"],
+        "command_results": worktree_result["command_results"],
     }
 
 
