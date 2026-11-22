@@ -23,6 +23,55 @@ import subprocess
 import sys
 import tempfile
 from typing import Iterable
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+from code_chunks import (  # noqa: E402
+    analyze_file_chunks,
+    check_staged_intrafile_refs,
+    parse_line_spec,
+    stage_file_lines,
+)
+from commit_sizing import (  # noqa: E402
+    DEFAULT_MAX_COMMIT_FILES,
+    DEFAULT_MAX_COMMIT_LOGIC_LINES,
+    DEFAULT_MAX_PR_LOGIC_LINES,
+    LineStats,
+    SizingConfig,
+    _read_text_safe,
+    _stats_from_full_text,
+    classify_file_role,
+    classify_source_lines,
+    compute_hunk_dict,
+    compute_hunk_line_stats,
+    load_sizing_config,
+)
+from coverage_parsers import (  # noqa: E402
+    DEFAULT_REPORT_CANDIDATES,
+    MAX_FILES_PER_COV_SNAPSHOT,
+    CoverageSnapshot,
+    FileCoverageStat,
+    collect_worktree_coverage,
+    merge_coverage_snapshots,
+    parse_coverage_report,
+)
+from coverage_ratchet import (  # noqa: E402
+    EXECUTABLE_CODE_EXTS,
+    GOVERNANCE_CONFIG_REL_PATH,
+    MAX_PINNED_COV_ENTRIES,
+    MAX_ROLLING_COV_ENTRIES,
+    CoverageCache,
+    CoverageConfig,
+    _build_worktree_env,
+    _capture_baseline_coverage_snapshot,
+    _ephemeral_worktree,
+    compare_coverage_snapshots,
+    detect_coverage_onboarding,
+    load_coverage_config,
+    resolve_upstream_anchor,
+    run_worktree_and_coverage_checks,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -101,14 +150,22 @@ class FileDiff:
     hunks: list[DiffHunk]
 
 
-def parse_single_file_diff(repo: Path, rel_path: str, *, cached: bool = False) -> FileDiff:
+def parse_single_file_diff(
+    repo: Path,
+    rel_path: str,
+    *,
+    cached: bool = False,
+    base_ref: str | None = None,
+) -> FileDiff:
     """Parse `git diff` for a single file into its file header and numbered hunks."""
     cmd = ["diff"]
-    if cached:
+    if base_ref is not None:
+        cmd.append(base_ref)
+    elif cached:
         cmd.append("--cached")
     cmd.extend(["--no-color", "--unified=3", "--", rel_path])
-    res = run_git(cmd, repo)
-    raw = res.stdout
+    raw_bytes = _run_git_bytes(cmd, repo)
+    raw = raw_bytes.decode("utf-8", errors="replace")
     if not raw.strip():
         return FileDiff(file_path=rel_path, header_lines=[], hunks=[])
 
@@ -203,6 +260,132 @@ def stage_file_hunks(repo: Path, rel_path: str, hunk_indices: list[int]) -> None
         patch_text += "\n"
 
     run_git(["apply", "--cached", "--recount", "-"], repo, input_text=patch_text)
+
+
+# ---------------------------------------------------------------------------
+# Commit & PR line counting and sizing classification
+# ---------------------------------------------------------------------------
+
+
+def _read_git_blob_text_safe(repo: Path, spec: str) -> str | None:
+    """Read a UTF-8 git object (`HEAD:path` or `:path`) safely, returning None on missing/binary."""
+    res = subprocess.run(
+        ["git", "show", spec],
+        cwd=str(repo),
+        capture_output=True,
+        check=False,
+    )
+    if res.returncode != 0 or b"\x00" in res.stdout:
+        return None
+    try:
+        return res.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _get_classified_blobs_for_diff(
+    repo: Path,
+    rel_path: str,
+    role: str,
+    *,
+    cached: bool = False,
+    base_ref: str | None = None,
+    new_text_override: str | None = None,
+) -> tuple[tuple[set[int], set[int]] | None, tuple[set[int], set[int]] | None]:
+    """Return `(old_classified, new_classified)` line sets for a diffed file."""
+    if role == "generated":
+        return (None, None)
+
+    old_classified: tuple[set[int], set[int]] | None = None
+    new_classified: tuple[set[int], set[int]] | None = None
+
+    if has_head_commit(repo) and (base_ref == "HEAD" or cached):
+        old_text = _read_git_blob_text_safe(repo, f"HEAD:{rel_path}")
+    elif not cached and base_ref is None:
+        old_text = _read_git_blob_text_safe(repo, f":{rel_path}")
+    else:
+        old_text = None
+    if old_text is not None:
+        old_classified = classify_source_lines(rel_path, old_text.splitlines())
+
+    new_text = new_text_override
+    if new_text is None:
+        if cached:
+            new_text = _read_git_blob_text_safe(repo, f":{rel_path}")
+        else:
+            new_text = _read_text_safe(repo / rel_path)
+    if new_text is not None:
+        new_classified = classify_source_lines(rel_path, new_text.splitlines())
+
+    return (old_classified, new_classified)
+
+
+def get_file_hunks_with_stats(
+    repo: Path,
+    rel_path: str,
+    *,
+    cached: bool = False,
+    sizing_config: SizingConfig | None = None,
+) -> tuple[FileDiff, list[dict]]:
+    """Parse diff hunks for `rel_path` and attach full-blob categorized line stats to each hunk."""
+    fdiff = parse_single_file_diff(repo, rel_path, cached=cached)
+    if not fdiff.hunks:
+        return (fdiff, [])
+
+    cfg = sizing_config or load_sizing_config(repo, get_staged_files(repo) if cached else None)
+    role = classify_file_role(rel_path, config=cfg)
+    old_classified, new_classified = _get_classified_blobs_for_diff(
+        repo, rel_path, role, cached=cached
+    )
+    hunk_dicts = [
+        compute_hunk_dict(
+            rel_path,
+            h,
+            old_classified=old_classified,
+            new_classified=new_classified,
+            config=cfg,
+        )
+        for h in fdiff.hunks
+    ]
+    return (fdiff, hunk_dicts)
+
+
+def _compute_file_diff_stats(
+    repo: Path,
+    rel_path: str,
+    *,
+    cached: bool = False,
+    base_ref: str | None = None,
+    new_text_override: str | None = None,
+    sizing_config: SizingConfig | None = None,
+) -> LineStats:
+    """Compute categorized LineStats for a single diffed file using full-blob context."""
+    role = classify_file_role(rel_path, config=sizing_config)
+    stats = LineStats(file_role=role)
+    fdiff = parse_single_file_diff(repo, rel_path, cached=cached, base_ref=base_ref)
+    if not fdiff.hunks:
+        return stats
+
+    old_classified, new_classified = _get_classified_blobs_for_diff(
+        repo,
+        rel_path,
+        role,
+        cached=cached,
+        base_ref=base_ref,
+        new_text_override=new_text_override,
+    )
+
+    for hunk in fdiff.hunks:
+        hunk_stats = compute_hunk_line_stats(
+            rel_path,
+            hunk,
+            old_classified=old_classified,
+            new_classified=new_classified,
+            config=sizing_config,
+        )
+        stats.add_other(hunk_stats)
+
+    return stats
 
 
 # ---------------------------------------------------------------------------

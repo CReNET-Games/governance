@@ -449,3 +449,61 @@ def test_status_and_stage_handle_spaces_and_unicode_filenames(temp_git_repo: Pat
     atomic_commit.main(["--repo", str(temp_git_repo), "stage", "--reset", "--files", "assets/hero sprite.ts"])
     assert "assets/hero sprite.ts" in atomic_commit.get_staged_files(temp_git_repo)
 
+
+@pytest.mark.parametrize(
+    ("rel_path", "initial_text", "updated_text", "cached", "expected_role", "expected_logic", "expected_comment"),
+    [
+        pytest.param(
+            "mod.py",
+            'def fn():\n    """start\n    old doc\n    """\n    return 1\n',
+            'def fn():\n    """start\n    new doc\n    """\n    return 1\n',
+            False,
+            "production",
+            0,
+            2,
+            id="worktree_docstring_comment_only",
+        ),
+        pytest.param(
+            "uv.lock",
+            "v = 1\n",
+            "v = 2\n",
+            True,
+            "generated",
+            0,
+            0,
+            id="staged_generated_lockfile",
+        ),
+    ],
+)
+def test_get_file_hunks_and_diff_stats_full_blob(
+    temp_git_repo: Path,
+    rel_path: str,
+    initial_text: str,
+    updated_text: str,
+    cached: bool,
+    expected_role: str,
+    expected_logic: int,
+    expected_comment: int,
+):
+    """Verifies get_file_hunks_with_stats and _compute_file_diff_stats across worktree and cached diffs."""
+    target = temp_git_repo / rel_path
+    target.write_text(initial_text, encoding="utf-8")
+    subprocess.run(["git", "add", rel_path], cwd=temp_git_repo, check=True)
+    subprocess.run(["git", "commit", "-m", f"add {rel_path}"], cwd=temp_git_repo, check=True, capture_output=True)
+
+    target.write_text(updated_text, encoding="utf-8")
+    if cached:
+        subprocess.run(["git", "add", rel_path], cwd=temp_git_repo, check=True)
+
+    _, hunk_dicts = atomic_commit.get_file_hunks_with_stats(temp_git_repo, rel_path, cached=cached)
+    assert len(hunk_dicts) == 1
+    assert hunk_dicts[0]["logic_lines"] == expected_logic
+    assert hunk_dicts[0]["comment_lines"] == expected_comment
+
+    stats = atomic_commit._compute_file_diff_stats(
+        temp_git_repo, rel_path, cached=cached, base_ref="HEAD" if cached else None
+    )
+    assert stats.file_role == expected_role
+    assert stats.logic_lines == expected_logic
+    assert stats.comment_lines == expected_comment
+
