@@ -122,8 +122,7 @@ if [ "$GLOBAL_MODE" -eq 1 ]; then
 
   mkdir -p "$GLOBAL_DIR/mcp-server" "$GLOBAL_DIR/scripts" "$GLOBAL_DIR/schemas"
   cp "$SCRIPT_DIR/mcp-server/server.py" "$GLOBAL_DIR/mcp-server/server.py"
-  cp "$SCRIPT_DIR/scripts/atomic_commit.py" "$GLOBAL_DIR/scripts/atomic_commit.py"
-  cp "$SCRIPT_DIR/scripts/ledger.py" "$GLOBAL_DIR/scripts/ledger.py"
+  cp "$SCRIPT_DIR/scripts/"*.py "$GLOBAL_DIR/scripts/"
   cp "$SCRIPT_DIR/scripts/run-mcp.sh" "$GLOBAL_DIR/scripts/run-mcp.sh"
   cp "$SCRIPT_DIR/schemas/asset_ledger_schema.json" "$GLOBAL_DIR/schemas/asset_ledger_schema.json"
   cp "$SCRIPT_DIR/fastmcp.json" "$GLOBAL_DIR/fastmcp.json"
@@ -131,7 +130,7 @@ if [ "$GLOBAL_MODE" -eq 1 ]; then
   if [ -f "$SCRIPT_DIR/uv.lock" ]; then
     cp "$SCRIPT_DIR/uv.lock" "$GLOBAL_DIR/uv.lock"
   fi
-  chmod +x "$GLOBAL_DIR/scripts/run-mcp.sh" "$GLOBAL_DIR/scripts/ledger.py" "$GLOBAL_DIR/scripts/atomic_commit.py"
+  chmod +x "$GLOBAL_DIR/scripts/run-mcp.sh" "$GLOBAL_DIR/scripts/"*.py
 
   if [ "${CRENET_SKIP_UV_SYNC:-0}" != "1" ]; then
     if command -v uv >/dev/null 2>&1; then
